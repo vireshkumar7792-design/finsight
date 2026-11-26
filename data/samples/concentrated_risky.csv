@@ -1,0 +1,5 @@
+ticker,quantity,avg_buy_price,buy_date,asset_type,currency
+TSLA,300,174.00,2024-05-15,equity,USD
+COIN,30,214.80,2024-05-15,equity,USD
+AAPL,10,189.70,2024-05-15,equity,USD
+SPY,5,529.80,2024-05-15,etf,USD

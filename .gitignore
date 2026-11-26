@@ -1,0 +1,39 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Chroma vector store data
+chroma/
+chroma_db/
+data/chroma/
+
+# LangGraph SqliteSaver checkpoints
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+checkpoints/
+
+# Downloaded 10-K files (keep folder, not contents)
+data/filings/*
+!data/filings/.gitkeep
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

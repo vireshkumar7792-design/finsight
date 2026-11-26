@@ -1,0 +1,9 @@
+ticker,quantity,avg_buy_price,buy_date,asset_type,currency
+AAPL,25,184.90,2023-06-15,equity,USD
+MSFT,15,331.80,2023-09-12,equity,USD
+JPM,20,172.60,2024-01-22,equity,USD
+JNJ,30,157.40,2024-02-08,equity,USD
+VTI,40,224.90,2023-11-20,etf,USD
+VXUS,60,57.30,2024-01-10,etf,USD
+BND,120,69.40,2023-10-05,bond,USD
+AGG,50,97.30,,bond,USD

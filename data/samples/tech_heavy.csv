@@ -1,0 +1,7 @@
+ticker,quantity,avg_buy_price,buy_date,asset_type,currency
+AAPL,40,181.20,2024-01-05,equity,USD
+MSFT,25,406.50,2024-02-15,equity,USD
+NVDA,80,42.10,2023-10-18,equity,USD
+GOOGL,50,138.10,2024-03-01,equity,USD
+AMZN,45,185.10,2024-04-10,equity,USD
+QQQ,20,450.20,2024-06-03,etf,USD
