@@ -30,12 +30,15 @@ streamlit · python-dotenv · pytest · LangSmith tracing.
 data/samples/          sample portfolio CSVs (balanced, tech_heavy, concentrated_risky)
 data/filings/          10-K files for RAG (contents git-ignored)
 src/finsight/
-  config.py            settings + get_llm(role)
+  config.py            Settings (pydantic-settings, .env) + get_llm(role): router=Groq, agent/report=OpenRouter
+  context.py           PortfolioContext: CSV + market data loaded once per run, injected into tools
+  cli.py               `python -m finsight.cli <csv> "<question>" [--free] [--messages]`
   schemas/             Pydantic models (holdings, metrics, Insight/Source, report)
   tools/               deterministic math + market data (portfolio_math, risk_math, market_data)
   mcp_servers/         FastMCP servers wrapping tools/ (portfolio_server, market_server)
   rag/                 ingest.py (10-K -> Chroma), retriever.py (query with citations)
-  agents/              supervisor, portfolio, research, risk, report
+  agents/              tools.py (payload fns + @tool wrappers), analyst.py (Phase 2 single agent),
+                       supervisor, portfolio, research, risk, report (Phase 3+)
   guardrails/          validators.py, risk_classifier.py
   graph.py             StateGraph wiring, checkpointer, interrupt
 app/streamlit_app.py   UI
@@ -47,8 +50,14 @@ Required: ticker, quantity, avg_buy_price. `asset_type` ∈ equity|etf|bond|cryp
 
 ## Commands
 - Install / sync env: `uv sync`
-- Run tests: `uv run pytest`
-- Add a dependency: `uv add <pkg>` (dev-only: `uv add --dev <pkg>`)
+- Run tests: `uv run pytest` (offline). Live tests: `uv run pytest -m network` (yfinance), `uv run pytest -m llm` (real LLM, costs tokens)
+- Try the agent: `uv run python -m finsight.cli data/samples/balanced.csv "What's my sector exposure?"` (`--free` = Groq)
+- Add a dependency: `uv add --no-sync <pkg>` then `uv sync` (dev-only: `--dev`)
+
+**OneDrive gotcha:** the project lives in OneDrive, which locks files in `.venv` and makes uv's reinstall of
+the editable `finsight` package fail with "Access is denied (os error 5)". Workarounds: `uv run --no-sync ...`
+(editable install means code changes are live); if `import finsight` breaks, delete the empty
+`.venv/Lib/site-packages/finsight-0.1.0.dist-info` folder and `uv sync`. Permanent fix: move the project out of OneDrive.
 
 ## RULES
 1. **The LLM never does math.** All calculations live in deterministic Python in `tools/`. Agents call tools and interpret results.

@@ -9,9 +9,10 @@ Bottom-up. A phase starts only when the previous phase's tests pass.
   - Pydantic holding schema + CSV loader; `portfolio_math`, `risk_math`, `market_data` (yfinance).
   - Done when: all three sample CSVs validate (and bad CSVs fail with clear errors), and every tool function has a known-answer pytest that passes offline (market data mocked).
 
-- [ ] **Phase 2: Single agent with tools + `get_llm(role)` config**
-  - `config.py` with `get_llm(role)` (Groq vs OpenRouter); one tool-calling agent over the Phase 1 tools.
-  - Done when: one agent answers "summarize my portfolio" for a sample CSV using only tool outputs for numbers, `get_llm` is unit-tested, and the run is visible in LangSmith.
+- [x] **Phase 2: Single agent with tools + `get_llm(role)` config**
+  - `config.py` (Settings + `get_llm(role)`), cash support, `PortfolioContext`, 5 LangChain tools, `create_agent` analyst, CLI.
+  - Done when: offline `uv run pytest` passes, and on the real LLM these call the right tools: sector exposure (balanced), how risky (concentrated_risky), biggest loser (tech_heavy), diversified? (allocation + HHI + correlations).
+  - Pending (user): set `LANGSMITH_API_KEY` in `.env` and confirm a trace appears in the `finsight` project.
 
 - [ ] **Phase 3: Multi-agent LangGraph + SqliteSaver**
   - Supervisor (structured-output routing), Portfolio, Risk, Report agents; Research stubbed; shared state; SqliteSaver checkpoints.

@@ -21,6 +21,7 @@ dependencies = [
     "numpy>=2.4.6",
     "pandas>=3.1.1",
     "pydantic>=2",
+    "pydantic-settings>=2.16.3",
     "python-dotenv>=1.2.4",
     "sentence-transformers>=6.3.0",
     "streamlit>=1.67.0",
@@ -39,5 +40,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -m 'not network'"
-markers = ["network: hits the internet; deselected by default (run with: uv run pytest -m network)"]
+addopts = "-ra -m 'not network and not llm'"
+markers = [
+    "network: hits the internet; deselected by default (run with: uv run pytest -m network)",
+    "llm: calls a real LLM API (costs tokens); deselected by default (run with: uv run pytest -m llm)",
+]

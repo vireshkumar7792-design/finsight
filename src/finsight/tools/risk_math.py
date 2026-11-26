@@ -73,7 +73,7 @@ def historical_var(returns: pd.Series, confidence: float = 0.95) -> float:
     if not 0 < confidence < 1:
         raise ValueError("confidence must be between 0 and 1")
     r = _clean(returns)
-    return float(-np.quantile(r.to_numpy(), 1 - confidence))
+    return float(-np.quantile(r.to_numpy(), 1 - confidence)) + 0.0  # + 0.0 turns -0.0 into 0.0
 
 
 def max_drawdown(prices: pd.Series) -> float:
@@ -109,10 +109,45 @@ def max_weight(weights: Mapping[str, float]) -> tuple[str, float]:
 
 
 def correlation_matrix(returns: pd.DataFrame) -> pd.DataFrame:
-    """Pearson correlation between columns (tickers) of a returns DataFrame."""
+    """Pearson correlation between columns (tickers) of a returns DataFrame.
+
+    A constant series (e.g. cash) has zero variance, so its correlations are undefined: NaN.
+    """
     if returns.shape[1] < 2:
         raise ValueError("need at least 2 assets for a correlation matrix")
     return returns.dropna().corr()
+
+
+def correlation_pairs(corr: pd.DataFrame) -> list[tuple[str, str, float]]:
+    """Unique off-diagonal pairs (a, b, rho), highest correlation first. Undefined (NaN) pairs skipped."""
+    cols = list(corr.columns)
+    pairs = [
+        (a, b, float(corr.loc[a, b]))
+        for i, a in enumerate(cols)
+        for b in cols[i + 1 :]
+        if not np.isnan(corr.loc[a, b])
+    ]
+    return sorted(pairs, key=lambda p: p[2], reverse=True)
+
+
+def average_correlation_by_asset(corr: pd.DataFrame) -> dict[str, float]:
+    """For each asset, mean correlation with every OTHER asset (NaN pairs skipped), lowest first.
+
+    Low values identify the holdings that diversify the rest of the portfolio.
+    Assets with no defined correlations (e.g. cash) are omitted.
+    """
+    out = {}
+    for a in corr.columns:
+        others = corr.loc[a].drop(a).dropna()
+        if len(others):
+            out[a] = float(others.mean())
+    return dict(sorted(out.items(), key=lambda kv: kv[1]))
+
+
+def average_pairwise_correlation(corr: pd.DataFrame) -> float | None:
+    """Mean of defined off-diagonal correlations; None if there are no defined pairs."""
+    pairs = correlation_pairs(corr)
+    return float(np.mean([p[2] for p in pairs])) if pairs else None
 
 
 def portfolio_returns(returns: pd.DataFrame, weights: Mapping[str, float]) -> pd.Series:

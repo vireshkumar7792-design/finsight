@@ -11,7 +11,7 @@ HEADER = "ticker,quantity,avg_buy_price,buy_date,asset_type,currency\n"
 
 
 @pytest.mark.parametrize(
-    "name, n_holdings", [("balanced.csv", 8), ("tech_heavy.csv", 6), ("concentrated_risky.csv", 4)]
+    "name, n_holdings", [("balanced.csv", 9), ("tech_heavy.csv", 6), ("concentrated_risky.csv", 4)]
 )
 def test_sample_csvs_validate(samples_dir, name, n_holdings):
     p = load_portfolio_csv(samples_dir / name)

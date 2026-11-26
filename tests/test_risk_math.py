@@ -115,3 +115,58 @@ def test_portfolio_returns_missing_history_raises():
 def test_too_few_observations_raises():
     with pytest.raises(ValueError, match="at least 2"):
         rm.annualized_volatility(pd.Series([0.01]))
+
+
+# ---- cash: a constant price series (zero returns) is valid data, not missing data ----------
+
+
+def test_constant_series_risk_is_zero():
+    prices = pd.Series([1.0, 1.0, 1.0, 1.0])
+    r = rm.simple_returns(prices)
+    assert rm.annualized_volatility(r) == 0.0
+    assert rm.max_drawdown(prices) == 0.0
+    var = rm.historical_var(r)
+    assert var == 0.0 and math.copysign(1, var) == 1  # +0.0, not -0.0
+    assert rm.beta(r, pd.Series([0.01, -0.02, 0.03])) == 0.0
+
+
+def test_cash_halves_volatility():
+    # 50% cash: portfolio return = 0.5 * asset return, so vol is exactly half.
+    df = pd.DataFrame({"A": [0.02, -0.01, 0.03, -0.02], "CASH": [0.0] * 4})
+    full = rm.annualized_volatility(df["A"])
+    half = rm.annualized_volatility(rm.portfolio_returns(df, {"A": 0.5, "CASH": 0.5}))
+    assert half == pytest.approx(full / 2)
+
+
+def test_correlation_with_cash_is_undefined_and_skipped():
+    df = pd.DataFrame({"A": [0.01, 0.02, 0.03], "B": [0.02, 0.04, 0.06], "CASH": [0.0, 0.0, 0.0]})
+    corr = rm.correlation_matrix(df)
+    assert np.isnan(corr.loc["A", "CASH"])
+    assert rm.correlation_pairs(corr) == [("A", "B", pytest.approx(1.0))]
+    assert rm.average_pairwise_correlation(corr) == pytest.approx(1.0)
+
+
+def test_correlation_pairs_sorted_high_to_low():
+    df = pd.DataFrame({"A": [0.01, 0.02, 0.03, 0.01], "B": [0.02, 0.04, 0.06, 0.02], "C": [0.03, 0.02, 0.01, 0.02]})
+    pairs = rm.correlation_pairs(rm.correlation_matrix(df))
+    assert [p[:2] for p in pairs][0] == ("A", "B")
+    assert [p[2] for p in pairs] == sorted([p[2] for p in pairs], reverse=True)
+    assert len(pairs) == 3  # 3 choose 2
+
+
+def test_average_pairwise_correlation_none_when_no_pairs():
+    corr = rm.correlation_matrix(pd.DataFrame({"A": [0.0, 0.0], "B": [0.0, 0.0]}))
+    assert rm.average_pairwise_correlation(corr) is None
+
+
+def test_average_correlation_by_asset():
+    # A-B 0.8, A-C 0.2, B-C -0.4; D is cash (all NaN).
+    # A: (0.8+0.2)/2 = 0.5   B: (0.8-0.4)/2 = 0.2   C: (0.2-0.4)/2 = -0.1   -> sorted low to high
+    nan = float("nan")
+    corr = pd.DataFrame(
+        [[1, 0.8, 0.2, nan], [0.8, 1, -0.4, nan], [0.2, -0.4, 1, nan], [nan, nan, nan, nan]],
+        index=list("ABCD"), columns=list("ABCD"),
+    )
+    avg = rm.average_correlation_by_asset(corr)
+    assert list(avg) == ["C", "B", "A"]
+    assert avg == pytest.approx({"C": -0.1, "B": 0.2, "A": 0.5})

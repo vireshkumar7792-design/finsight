@@ -16,6 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # US tickers: 1-10 chars, letters/digits plus "." or "-" for share classes (BRK.B, BF-B).
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
+CASH_PRICE = 1.0  # cash rows: quantity = USD amount, unit price fixed at $1
+
 
 class AssetType(StrEnum):
     """Economic exposure of a holding (used for allocation), not its legal wrapper."""
@@ -65,6 +67,17 @@ class Holding(BaseModel):
             raise ValueError(f"buy_date {v} is in the future")
         return v
 
+    @model_validator(mode="after")
+    def _cash_is_priced_at_one(self) -> Holding:
+        # For cash, quantity is the dollar amount and the unit price is fixed at $1.
+        if self.asset_type is AssetType.CASH and self.avg_buy_price != CASH_PRICE:
+            raise ValueError(f"cash must have avg_buy_price {CASH_PRICE} (quantity is the USD amount)")
+        return self
+
+    @property
+    def is_cash(self) -> bool:
+        return self.asset_type is AssetType.CASH
+
     @property
     def cost_basis(self) -> float:
         """Total amount paid for this position."""
@@ -93,3 +106,12 @@ class Portfolio(BaseModel):
     @property
     def tickers(self) -> list[str]:
         return [h.ticker for h in self.holdings]
+
+    @property
+    def market_tickers(self) -> list[str]:
+        """Tickers that need market data (everything except cash)."""
+        return [h.ticker for h in self.holdings if not h.is_cash]
+
+    def get(self, ticker: str) -> Holding | None:
+        t = ticker.strip().upper()
+        return next((h for h in self.holdings if h.ticker == t), None)

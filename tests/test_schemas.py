@@ -61,3 +61,20 @@ def test_portfolio_rejects_duplicates_and_empty():
 
 def test_portfolio_tickers(two_stock_portfolio):
     assert two_stock_portfolio.tickers == ["AAPL", "MSFT"]
+
+
+def test_cash_must_be_priced_at_one():
+    h = Holding(ticker="CASH", quantity=2500, avg_buy_price=1, asset_type="cash")
+    assert h.is_cash and h.cost_basis == 2500
+    with pytest.raises(ValidationError, match="cash must have avg_buy_price 1.0"):
+        Holding(ticker="CASH", quantity=2500, avg_buy_price=1.05, asset_type="cash")
+
+
+def test_market_tickers_and_get():
+    p = Portfolio(holdings=[
+        Holding(ticker="AAPL", quantity=1, avg_buy_price=1),
+        Holding(ticker="CASH", quantity=10, avg_buy_price=1, asset_type="cash"),
+    ])
+    assert p.market_tickers == ["AAPL"]
+    assert p.get(" aapl ").ticker == "AAPL"
+    assert p.get("MSFT") is None
