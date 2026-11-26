@@ -12,11 +12,12 @@ Bottom-up. A phase starts only when the previous phase's tests pass.
 - [x] **Phase 2: Single agent with tools + `get_llm(role)` config**
   - `config.py` (Settings + `get_llm(role)`), cash support, `PortfolioContext`, 5 LangChain tools, `create_agent` analyst, CLI.
   - Done when: offline `uv run pytest` passes, and on the real LLM these call the right tools: sector exposure (balanced), how risky (concentrated_risky), biggest loser (tech_heavy), diversified? (allocation + HHI + correlations).
-  - Pending (user): set `LANGSMITH_API_KEY` in `.env` and confirm a trace appears in the `finsight` project.
+  - LangSmith tracing confirmed (runs visible in project `finsight`).
 
-- [ ] **Phase 3: Multi-agent LangGraph + SqliteSaver**
-  - Supervisor (structured-output routing), Portfolio, Risk, Report agents; Research stubbed; shared state; SqliteSaver checkpoints.
-  - Done when: the graph runs end-to-end on all sample CSVs producing a report, routing logic is tested, and a run can be resumed from its checkpoint by thread_id.
+- [x] **Phase 3: Multi-agent LangGraph + SqliteSaver (zero-cost)**
+  - Supervisor (one structured-output planning call), Portfolio + Risk specialists, Research stub, structured Report with fallbacks; FinSightState with reducers; SqliteSaver checkpoints; follow-ups on a thread; free-tier models only, cost guard, request+token rate limiter, optional SQLite LLM cache; `cli_graph` with `--resume` / `--show-state`.
+  - Done when: offline `uv run pytest` passes; on FREE models, sector (balanced), risky (concentrated_risky), diversified+performance (tech_heavy, portfolio+risk) and "Research NVDA" (stub) run end-to-end with sensible routes; a killed run resumes by thread_id.
+  - Measured: 2 LLM calls (research stub), 4 (one specialist), 6 (two specialists); ~1.3K / 4-5K / 8-10K tokens.
 
 - [ ] **Phase 4: Research agent — 10-K RAG + Tavily, cited schemas**
   - Ingest 10-Ks into Chroma with local embeddings; retriever with citation metadata; Tavily search; `Insight`/`Source` schemas.

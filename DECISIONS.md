@@ -23,3 +23,17 @@ One line per decision: **what** we chose and **why**. Newest at the bottom. Phas
 - [P2] **Payload functions separate from `@tool` wrappers**: payloads are unit-tested directly and will be reused by MCP servers in Phase 5.
 - [P2] **Tools return percentages already converted (`_pct`/`_usd` suffixes) and pre-ranked fields** (e.g. worst position): unit conversion and ranking are math, so the LLM doesn't do them.
 - [P2] **When the LLM overgeneralizes, give it the missing data**: added per-holding average correlation after the model invented an MSFT claim from a single pair.
+- [P3] **Zero-cost policy**: all roles default to Groq free tier; OpenRouter only with `:free` ids; `get_llm()` refuses paid ids unless `FINSIGHT_ALLOW_PAID=true`.
+- [P3] **Models per role from measured capabilities**: router `gpt-oss-20b` (strict structured output, fast), agent `qwen3.8-27b` (only one with parallel tool calls -> 2 calls per specialist), report `gpt-oss-120b` (strongest, strict structured output). Qwen is preview; fallback is a one-line env change.
+- [P3] **Free limits measured from Groq response headers** (30 RPM, 1000 RPD, 8000 TPM per model) because the docs page didn't render free-plan numbers.
+- [P3] **Custom request+token limiter** instead of InMemoryRateLimiter: tokens/min is the binding free-tier limit and InMemoryRateLimiter only counts requests; SDK retry on 429 stays as a backstop.
+- [P3] **One limiter per model id, shared across roles**: Groq limits are per model, so roles on the same model share one budget.
+- [P3] **Own 40-line SQLiteLLMCache** (core BaseCache) instead of adding langchain-community; deserialization restricted to Generation/ChatGeneration/AIMessage.
+- [P3] **Supervisor plans once, then walks the plan deterministically**: 1 router call per question instead of one per hop; routing is still LLM-decided.
+- [P3] **Every question ends in the report node** ("finish" coerced to report): the user always gets an answer, and fallbacks have one place to land.
+- [P3] **Specialists hand over Findings (tool payloads + short summary), not transcripts**: the report prompt stays small, and every number has a source id like `risk:get_risk_metrics`.
+- [P3] **Deterministic fallbacks at every LLM step**: router failure -> report; specialist without tool calls -> default tool data; report: structured x2 -> plain text -> no-LLM summary.
+- [P3] **Light traceability check now** (key metric value must appear in its source payload); full number-consistency guardrails are Phase 6.
+- [P3] **PortfolioContext stays out of state** (DataFrames would bloat checkpoints); state stores `portfolio_source` so resume can rebuild it.
+- [P3] **State holds plain dicts (model_dump), not Pydantic objects**: checkpoints serialize cleanly and safely; Pydantic validates at the node boundaries.
+- [P3] **Custom resettable reducers** (`accumulate`, `add_or_reset`; `None` resets): per-question logs restart on a follow-up while `messages` keeps the conversation.

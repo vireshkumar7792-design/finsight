@@ -27,6 +27,8 @@ data/chroma/
 *.db-wal
 *.db-shm
 checkpoints/
+data/checkpoints/
+data/cache/
 
 # Downloaded 10-K files (keep folder, not contents)
 data/filings/*

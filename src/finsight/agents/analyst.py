@@ -67,7 +67,7 @@ class AnalystResult:
     messages: list[AnyMessage]
 
 
-def _text(msg: AIMessage) -> str:
+def message_text(msg: AIMessage) -> str:
     """Final text of an AI message (content may be a string or a list of content blocks)."""
     if isinstance(msg.content, str):
         return msg.content
@@ -88,4 +88,7 @@ def ask(question: str, ctx: PortfolioContext, agent=None) -> AnalystResult:
         for tc in m.tool_calls
     ]
     final = next((m for m in reversed(messages) if isinstance(m, AIMessage) and not m.tool_calls), None)
-    return AnalystResult(answer=_text(final) if final else "", tool_calls=calls, messages=messages)
+    return AnalystResult(answer=message_text(final) if final else "", tool_calls=calls, messages=messages)
+
+
+_text = message_text  # backwards-compatible alias
