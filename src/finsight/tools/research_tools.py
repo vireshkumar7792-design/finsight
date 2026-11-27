@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from finsight.rag.ingest import LocalEmbedder, open_collection
+from finsight.rag.ingest import make_embeddings, open_vector_store
 from finsight.rag.retriever import search_filings
 from finsight.schemas import Source
 
@@ -27,17 +27,15 @@ EXCLUDED_DOMAINS = ["tavily.com"]  # Tavily's own profile pages are summaries, n
 
 @dataclass
 class ResearchSources:
-    collection: object | None  # Chroma collection of 10-K chunks (None = no filings)
-    embedder: object | None
+    vector_store: object | None  # LangChain Chroma store of 10-K chunks (None = no filings)
     tavily_api_key: str | None
     tavily_cache_dir: str
 
 
 def open_research_sources(settings) -> ResearchSources:
-    embedder = LocalEmbedder(settings.embedding_model)
-    collection = open_collection(settings.chroma_path, embedder.name)
+    vector_store = open_vector_store(settings.chroma_path, make_embeddings(settings.embedding_model))
     api_key = settings.tavily_api_key.get_secret_value() if settings.tavily_api_key else None
-    return ResearchSources(collection, embedder, api_key, settings.tavily_cache_dir)
+    return ResearchSources(vector_store, api_key, settings.tavily_cache_dir)
 
 
 # =========================
@@ -91,17 +89,18 @@ class WebSearch(BaseModel):
 def run_filing_search(research: ResearchSources, found: FoundSources, query: str,
                       ticker: str | None = None, section: str | None = None) -> int:
     """Search the 10-Ks and record each chunk as a Source. Returns the number of results."""
-    if research.collection is None:
+    if research.vector_store is None:
         found.add_gap("filing search unavailable (no 10-K index)")
         return 0
-    hits = search_filings(research.collection, research.embedder, query, ticker, section,
-                          k=FILING_RESULTS_PER_SEARCH)
-    if ticker and not hits:
+    chunks = search_filings(research.vector_store, query, ticker, section, k=FILING_RESULTS_PER_SEARCH)
+    if ticker and not chunks:
         found.add_gap(f"no 10-K ingested for {ticker.upper()} (run: finsight ingest {ticker.upper()})")
-    for hit in hits:
-        title = f"{hit['company']} 10-K FY{hit['fiscal_year']}, {hit['section']}"
-        found.add(Source(id=hit["id"], type="filing", title=title, url=hit["url"], section=hit["section"]), hit["text"])
-    return len(hits)
+    for chunk in chunks:
+        facts = chunk.metadata
+        title = f"{facts['company']} 10-K FY{facts['fiscal_year']}, {facts['section']}"
+        source = Source(id=chunk.id, type="filing", title=title, url=facts["url"], section=facts["section"])
+        found.add(source, chunk.page_content)
+    return len(chunks)
 
 
 def run_web_search(research: ResearchSources, found: FoundSources, query: str,

@@ -80,8 +80,7 @@ def test_tavily_problems_become_gaps_not_crashes(monkeypatch, tmp_path):
 
 
 def research_sources(filings_index, tmp_path):
-    collection, embedder = filings_index
-    return ResearchSources(collection, embedder, tavily_api_key=None, tavily_cache_dir=str(tmp_path))
+    return ResearchSources(filings_index, tavily_api_key=None, tavily_cache_dir=str(tmp_path))
 
 
 def writer_draft():

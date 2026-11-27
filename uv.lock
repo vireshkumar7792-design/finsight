@@ -920,10 +920,13 @@ dependencies = [
     { name = "chromadb" },
     { name = "httpx" },
     { name = "langchain" },
+    { name = "langchain-chroma" },
     { name = "langchain-core" },
     { name = "langchain-groq" },
+    { name = "langchain-huggingface" },
     { name = "langchain-mcp-adapters" },
     { name = "langchain-openai" },
+    { name = "langchain-text-splitters" },
     { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
     { name = "langsmith" },
@@ -952,10 +955,13 @@ requires-dist = [
     { name = "chromadb", specifier = ">=1.5.9" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "langchain", specifier = ">=1.5.2" },
+    { name = "langchain-chroma", specifier = ">=1.2.0" },
     { name = "langchain-core", specifier = ">=1.8.4" },
     { name = "langchain-groq", specifier = ">=1.2.1" },
+    { name = "langchain-huggingface", specifier = ">=1.3.0" },
     { name = "langchain-mcp-adapters", specifier = ">=0.3.2" },
     { name = "langchain-openai", specifier = ">=1.8.5" },
+    { name = "langchain-text-splitters", specifier = ">=1.2.0" },
     { name = "langgraph", specifier = ">=1.2.24" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.3" },
     { name = "langsmith", specifier = ">=0.16.2" },
@@ -1674,6 +1680,21 @@ wheels = [
 ]
 
 [[package]]
+name = "langchain-chroma"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "chromadb" },
+    { name = "langchain-core" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e1/b3/37eb7a9a12c4d49bb3bd07ffc40d0fcdfeaeb9f6a6c2b428afee69ee6694/langchain_chroma-1.2.0.tar.gz", hash = "sha256:609c8b554ce9d11e99db8520fed021c5dbbcf525bd6ae04707a87d0147d142fa", size = 186924, upload-time = "2026-11-23T17:04:38.196Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/90/04/ef72ea667882268227ffeafc27882b1e7ae75bde03db4407db1802ab5e7b/langchain_chroma-1.2.0-py3-none-any.whl", hash = "sha256:54e7c8e1b347c1f8bc6becdc641410f8947629a013b70ca58a51330bfcdcbd2c", size = 13536, upload-time = "2026-11-23T17:04:37.48Z" },
+]
+
+[[package]]
 name = "langchain-core"
 version = "1.8.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1706,6 +1727,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/8f/6b/f20ff541e7d50848306c379541bc204b77ffff07b088688b3d78fe1072fb/langchain_groq-1.2.1.tar.gz", hash = "sha256:0ce10a14be647bf7d1c1c66348c8d7124a8ab6857cc6d65e4984fed7b2215752", size = 194702, upload-time = "2026-11-18T17:27:06.216Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/30/bb/b02a9c5b97a3bca9950d5671d760bd0134176dba6d5eb34911e9dbea583d/langchain_groq-1.2.1-py3-none-any.whl", hash = "sha256:c279273547baf192c32013ea66f2da69ef6469e30b147483999911ff1ba5bf77", size = 21665, upload-time = "2026-11-18T17:27:05.091Z" },
+]
+
+[[package]]
+name = "langchain-huggingface"
+version = "1.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "langchain-core" },
+    { name = "tokenizers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ed/14/9ace05172c24e010da5ecbdd65f564e6bf455e5dafbb5678289ff552b67c/langchain_huggingface-1.3.0.tar.gz", hash = "sha256:37acedc5e40d75045b3b9ceed4a29d62c1af306d17012b5d86c97966dd8561bb", size = 248826, upload-time = "2026-11-23T20:48:44.234Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/9a/4b082023122f3bcc4206071aaf7d3f1f65df627da8014f4a19952265ee0c/langchain_huggingface-1.3.0-py3-none-any.whl", hash = "sha256:2944be5f2de653944565b6696d4c1bb72b8b8c54f12fc531c0896637d941de23", size = 34627, upload-time = "2026-11-23T20:48:43.231Z" },
 ]
 
 [[package]]
@@ -1747,6 +1782,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a2/5c/94ffa0c0b9445ac284bf7c0aebf2fa3a32bdf27c20aaf2f061746375b670/langchain_protocol-0.0.22.tar.gz", hash = "sha256:61267bc9f478c9df35ccdafd9fdf556b2698435232d59def54b3809bb02585bb", size = 6508, upload-time = "2026-11-19T15:47:56.068Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/71/0a/e96b6ca3b5a7d91af31fd82aee42e65beb6bbe884587e27df5460feee486/langchain_protocol-0.0.22-py3-none-any.whl", hash = "sha256:d264998a507b735320c15a7b366051cbf41e21f771bea1b03a911f2c58af02e7", size = 7579, upload-time = "2026-11-19T15:47:55.109Z" },
+]
+
+[[package]]
+name = "langchain-text-splitters"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/90/52/bf954839dd1ed651caaca7bd3f8e855d9cf86adf9e9a3b3d5805c6e1298d/langchain_text_splitters-1.2.0.tar.gz", hash = "sha256:b1910bc42bc4b708411f0df009b7f1b6fdcc96e52f0847f6a5a5c70deec4b91f", size = 270318, upload-time = "2026-11-23T16:11:27.511Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/42/fa/fe89d3109248e51890bd7839ee24576728b4aed7deb61a9f7afe57d7f381/langchain_text_splitters-1.2.0-py3-none-any.whl", hash = "sha256:be4e5b288ee7cd5c20c47f540cb359732cb2c83980ce4bab34120f63d1e40f76", size = 38211, upload-time = "2026-11-23T16:11:26.483Z" },
 ]
 
 [[package]]

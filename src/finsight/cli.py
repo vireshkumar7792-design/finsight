@@ -16,7 +16,7 @@ from finsight.agents.report_agent import DISCLAIMER
 from finsight.agents.research_agent import pick_tickers, run_research
 from finsight.config import get_llm, get_settings
 from finsight.graph import build_graph, make_run_context, open_checkpointer, resume_thread, run_question, thread_config
-from finsight.rag.ingest import LocalEmbedder, ingest_ticker, open_collection, sample_equity_tickers
+from finsight.rag.ingest import ingest_ticker, make_embeddings, open_vector_store, sample_equity_tickers
 from finsight.rag.retriever import indexed_tickers
 from finsight.tools.research_tools import open_research_sources
 
@@ -126,17 +126,16 @@ def ingest_command(args) -> int:
         raise ValueError('SEC_USER_AGENT is not set in .env (the SEC asks for "Name email@example.com")')
     user_agent = settings.sec_user_agent.get_secret_value()
 
-    embedder = LocalEmbedder(settings.embedding_model)
-    collection = open_collection(settings.chroma_path, embedder.name)
-    print(f"Ingesting {', '.join(tickers)} (embeddings run locally with {embedder.name})")
+    print(f"Ingesting {', '.join(tickers)} (embeddings run locally with {settings.embedding_model})")
+    vector_store = open_vector_store(settings.chroma_path, make_embeddings(settings.embedding_model))
     failures = 0
     for ticker in tickers:
-        result = ingest_ticker(ticker, user_agent, settings, collection, embedder, args.force)
+        result = ingest_ticker(ticker, user_agent, settings, vector_store, args.force)
         if result["status"].startswith("error"):
             failures += 1
         sections = ",".join(result["sections"]) or "-"
         print(f"  {result['ticker']:<6} {result['status']:<17} chunks={result['chunks']:<4} sections={sections}")
-    print(f"Done. The index now holds {collection.count()} chunks.")
+    print(f"Done. The index now holds {len(vector_store.get(include=[])['ids'])} chunks.")
     return 1 if failures == len(tickers) else 0
 
 
@@ -155,7 +154,7 @@ def research_command(args) -> int:
 
     print("Loading the local embedder and the 10-K index...")
     research = open_research_sources(settings)
-    print(f"10-Ks indexed: {', '.join(sorted(indexed_tickers(research.collection))) or 'none (run finsight ingest)'}")
+    print(f"10-Ks indexed: {', '.join(sorted(indexed_tickers(research.vector_store))) or 'none (run finsight ingest)'}")
 
     tickers = pick_tickers(args.question, args.ticker, [])
     result = run_research(args.question, tickers, research, search_llm, writer_llm)

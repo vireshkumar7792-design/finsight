@@ -22,7 +22,8 @@ what and the why, in simple English.
 
 ## Stack
 Python 3.11+ (3.12 locally) · uv · LangGraph (+ langgraph-checkpoint-sqlite) · LangChain ·
-langchain-groq · langchain-openai (pointed at OpenRouter) · chromadb · sentence-transformers ·
+langchain-groq · langchain-openai (pointed at OpenRouter) · langchain-chroma (chromadb) ·
+langchain-huggingface (local sentence-transformers) · langchain-text-splitters ·
 tavily-python · yfinance · pandas · numpy · pydantic v2 · httpx · beautifulsoup4 + lxml ·
 python-dotenv · pytest · LangSmith tracing. (mcp, langchain-mcp-adapters, streamlit: for later phases.)
 
@@ -44,9 +45,9 @@ src/finsight/
     research_tools.py    10-K search, Tavily search + cache, source registry (FoundSources)
   rag/
     edgar.py             download the latest 10-K from SEC EDGAR
-    parse.py             HTML -> text -> 10-K Items -> chunks
-    ingest.py            local embedder, Chroma collection, idempotent ingest
-    retriever.py         search Chroma with ticker/section filters
+    parse.py             HTML -> text -> one Document per 10-K Item -> chunks
+    ingest.py            HuggingFaceEmbeddings, Chroma vector store, idempotent ingest
+    retriever.py         similarity_search with ticker/section filters
   agents/
     common.py            ask_structured (try + retry once), run_tool_agent
     supervisor.py  portfolio_agent.py  risk_agent.py  research_agent.py  report_agent.py

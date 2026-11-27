@@ -24,7 +24,7 @@ def make_run_context(portfolio_context, router=(), agent=(), report=()) -> RunCo
         agent_llm=FakeLLM(script=list(agent)),
         report_llm=FakeLLM(structured=list(report)),
         settings=None,  # only used to open research sources, which tests pass in directly
-        research=ResearchSources(collection=None, embedder=None, tavily_api_key=None, tavily_cache_dir=""),
+        research=ResearchSources(vector_store=None, tavily_api_key=None, tavily_cache_dir=""),
     )
 
 

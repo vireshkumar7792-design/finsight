@@ -4,6 +4,7 @@ import hashlib
 import math
 import re
 
+from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -62,10 +63,10 @@ def tool_calls_message(*calls) -> AIMessage:
     return AIMessage(content="", tool_calls=tool_calls)
 
 
-class HashEmbedder:
-    """A fake embedder: texts that share words get similar vectors. No model download."""
+class HashEmbedder(Embeddings):
+    """A fake LangChain embedder: texts that share words get similar vectors. No model download."""
 
-    name = "hash-test-embedder"
+    model_name = "hash-test-embedder"
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return [self.embed_query(text) for text in texts]

@@ -70,20 +70,30 @@ Three ideas run through everything:
 
 ## rag/ — 10-K filings
 
+The RAG code uses standard LangChain pieces, so it reads like any LangChain tutorial:
+`Document` (text + metadata), `RecursiveCharacterTextSplitter`, `HuggingFaceEmbeddings`
+and the `Chroma` vector store. Only the 10-K-specific parts are our own code.
+
 - **edgar.py** downloads the latest 10-K from the SEC (free). The SEC asks for a User-Agent with
   contact details (`SEC_USER_AGENT`); it goes only into the request header and is never printed.
-  We wait 0.25 s between requests (the SEC allows 10 per second).
-- **parse.py** turns HTML into text and splits it into Items (1 Business, 1A Risk Factors, 7 MD&A…).
-  Every heading appears twice (table of contents + real start); the real start is the one followed
-  by the most text. If that fails, the whole filing becomes one "Full document" section.
-  Chunks are 220 words with 40 words of overlap (about 300 tokens, which fits the embedding
-  model's 512-token window). Item 8 (financial tables) is skipped: numbers are our tools' job.
-- **ingest.py** embeds chunks **locally** with `BAAI/bge-small-en-v1.5` (free, no API) and stores
-  them in Chroma. Chunk ids are fixed (`NVDA-10K-FY2026-1A-007`) and we *upsert*, so running
-  ingest twice never duplicates; if nothing changed, embedding is skipped. We pass our own
-  vectors to Chroma so it never downloads its own model, and Chroma telemetry is off.
-- **retriever.py** searches by meaning, with ticker and section filters applied **before** ranking.
-  Without the ticker filter, Apple's supply-chain paragraph could be cited for a NVIDIA question.
+  We wait 0.25 s between requests (the SEC allows 10 per second). LangChain has no SEC loader,
+  so this stays a plain `httpx` download.
+- **parse.py** turns HTML into text and splits it into one `Document` per Item (1 Business,
+  1A Risk Factors, 7 MD&A…). Every heading appears twice (table of contents + real start); the real
+  start is the one followed by the most text. If that fails, the whole filing becomes one
+  "Full document" section. The splitter then cuts each section into chunks of at most 1,200
+  characters with 200 characters of overlap (about 300 tokens, which fits the embedding model's
+  512-token window). It prefers to cut at paragraph and line breaks. Item 8 (financial tables) is
+  skipped: numbers are our tools' job.
+- **ingest.py** embeds chunks **locally** with `BAAI/bge-small-en-v1.5` through
+  `HuggingFaceEmbeddings` (free, no API). bge expects a short prefix on *questions* only, which we
+  pass as the query `prompt`. Chunk ids are fixed (`NVDA-10K-FY2026-1A-007`) and Chroma *upserts*
+  by id, so running ingest twice never duplicates; if nothing changed, embedding is skipped.
+  The store remembers which embedding model built it and refuses a different one (vectors from two
+  models can't be compared). Chroma telemetry is off.
+- **retriever.py** calls `similarity_search` with ticker and section filters, applied **before**
+  ranking. Without the ticker filter, Apple's supply-chain paragraph could be cited for a NVIDIA
+  question.
 
 ## state.py — what the graph remembers
 

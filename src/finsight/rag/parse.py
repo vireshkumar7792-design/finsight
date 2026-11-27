@@ -1,8 +1,10 @@
-"""10-K HTML -> clean text -> sections (Item 1, 1A, 7, ...) -> small overlapping chunks."""
+"""10-K HTML -> clean text -> one Document per section (Item 1, 1A, 7, ...) -> small overlapping chunks."""
 
 import re
 
 from bs4 import BeautifulSoup
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 SECTION_TITLES = {
     "1": "Business", "1A": "Risk Factors", "1B": "Unresolved Staff Comments", "1C": "Cybersecurity",
@@ -23,8 +25,8 @@ INDEXED_SECTIONS = {"1", "1A", "1C", "2", "3", "7", "7A", FULL_DOCUMENT}
 # A line that STARTS like "Item 1A. Risk Factors". Mid-sentence "see Item 7" doesn't match.
 HEADING = re.compile(r"^\s*item\s*(1[0-6]|[1-9])([abc])?\s*[.:\-–—]?\s*(.{0,120})$", re.IGNORECASE)
 
-CHUNK_WORDS = 220  # about 300 tokens: fits the embedding model's 512-token window
-OVERLAP_WORDS = 40  # a sentence on a chunk border stays whole in at least one chunk
+CHUNK_CHARS = 1200  # about 300 tokens: fits the embedding model's 512-token window
+OVERLAP_CHARS = 200  # a sentence on a chunk border stays whole in at least one chunk
 
 
 # =========================
@@ -53,24 +55,37 @@ def html_to_text(html: str) -> str:
 
 
 # =========================
-# Text -> sections
+# Text -> section Documents
 # =========================
 
 
-def split_sections(text: str) -> list[dict]:
-    """Split into Items. Each heading appears twice (table of contents + real start); the real
-    start is the one followed by the most text. If that fails, return one "Full document"."""
-    lines = text.split("\n")
+def split_sections(text: str) -> list[Document]:
+    """One Document per Item. Each heading appears twice (table of contents + real start); the
+    real start is the one followed by the most text. If that fails, return one "Full document"."""
+    best_start = find_section_starts(text)
+    if len(best_start) < 2 or not ({"1A", "7"} & set(best_start)):
+        return [section_document(FULL_DOCUMENT, "Full document", text)]
+
+    starts = sorted((start, key) for key, start in best_start.items())
+    sections = []
+    for i, (start, key) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(text)
+        body = text[start:end].split("\n", 1)  # drop the heading line itself
+        title = f"Item {key} {SECTION_TITLES.get(key, '')}".strip()
+        sections.append(section_document(key, title, body[1].strip() if len(body) > 1 else ""))
+    return sections
+
+
+def find_section_starts(text: str) -> dict[str, int]:
+    """Item key -> character position of its heading, keeping the occurrence with the most text after it."""
     headings = []  # (character position, item key)
     position = 0
-    for line in lines:
+    for line in text.split("\n"):
         match = HEADING.match(line)
         if match and len(line) <= 160:
-            key = (match.group(1) + (match.group(2) or "")).upper()
-            headings.append((position, key))
+            headings.append((position, (match.group(1) + (match.group(2) or "")).upper()))
         position += len(line) + 1
 
-    # For each item key, keep the occurrence followed by the longest stretch of text.
     best_start = {}
     best_length = {}
     for i, (start, key) in enumerate(headings):
@@ -78,21 +93,11 @@ def split_sections(text: str) -> list[dict]:
         if end - start > best_length.get(key, -1):
             best_length[key] = end - start
             best_start[key] = start
+    return best_start
 
-    if len(best_start) < 2 or not ({"1A", "7"} & set(best_start)):
-        return [{"key": FULL_DOCUMENT, "title": "Full document", "text": text}]
 
-    starts = sorted((start, key) for key, start in best_start.items())
-    sections = []
-    for i, (start, key) in enumerate(starts):
-        end = starts[i + 1][0] if i + 1 < len(starts) else len(text)
-        body = text[start:end].split("\n", 1)  # drop the heading line itself
-        sections.append({
-            "key": key,
-            "title": f"Item {key} {SECTION_TITLES.get(key, '')}".strip(),
-            "text": body[1].strip() if len(body) > 1 else "",
-        })
-    return sections
+def section_document(key: str, title: str, text: str) -> Document:
+    return Document(page_content=text, metadata={"section_key": key, "section": title})
 
 
 # =========================
@@ -100,26 +105,17 @@ def split_sections(text: str) -> list[dict]:
 # =========================
 
 
-def chunk_words(text: str, size: int = CHUNK_WORDS, overlap: int = OVERLAP_WORDS) -> list[str]:
-    """Sliding window over words: each chunk has `size` words; neighbours share `overlap`."""
-    words = text.split()
-    chunks = []
-    step = size - overlap
-    for start in range(0, len(words), step):
-        chunks.append(" ".join(words[start:start + size]))
-        if start + size >= len(words):
-            break
-    return chunks
-
-
-def make_chunks(sections: list[dict], filing: dict) -> list[dict]:
-    """Chunks with metadata. Ids are fixed (e.g. NVDA-10K-FY2026-1A-007), so re-ingesting overwrites."""
+def make_chunks(sections: list[Document], filing: dict) -> list[Document]:
+    """Chunks carry the filing facts as metadata. Ids are fixed (e.g. NVDA-10K-FY2026-1A-007),
+    so re-ingesting the same filing overwrites instead of duplicating."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_CHARS, chunk_overlap=OVERLAP_CHARS)
     chunks = []
     for section in sections:
-        if section["key"] not in INDEXED_SECTIONS:
+        key = section.metadata["section_key"]
+        if key not in INDEXED_SECTIONS:
             continue
-        for number, text in enumerate(chunk_words(section["text"])):
-            chunk_id = f"{filing['ticker']}-10K-FY{filing['fiscal_year']}-{section['key']}-{number:03d}"
-            metadata = {**filing, "section_key": section["key"], "section": section["title"]}
-            chunks.append({"id": chunk_id, "text": text, "metadata": metadata})
+        section_with_filing = Document(page_content=section.page_content, metadata={**filing, **section.metadata})
+        for number, chunk in enumerate(splitter.split_documents([section_with_filing])):
+            chunk.id = f"{filing['ticker']}-10K-FY{filing['fiscal_year']}-{key}-{number:03d}"
+            chunks.append(chunk)
     return chunks

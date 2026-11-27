@@ -8,7 +8,7 @@ import pytest
 from finsight.config import Settings
 from finsight.portfolio import market
 from finsight.portfolio.context import load_context
-from finsight.rag.ingest import ingest_html, open_collection
+from finsight.rag.ingest import ingest_html, open_vector_store
 from tests.fakes import HashEmbedder
 
 SAMPLES_DIR = Path(__file__).resolve().parents[1] / "data" / "samples"
@@ -88,9 +88,8 @@ def fake_filing(ticker: str) -> dict:
 
 @pytest.fixture
 def filings_index(tmp_path):
-    """A real Chroma collection on disk, filled using the fake embedder. Returns (collection, embedder)."""
-    embedder = HashEmbedder()
-    collection = open_collection(str(tmp_path / "chroma"), embedder.name)
-    ingest_html(MINI_10K, fake_filing("ACME"), collection, embedder)
-    ingest_html(MINI_10K, fake_filing("OTHER"), collection, embedder)
-    return collection, embedder
+    """A real Chroma store on disk, filled using the fake embedder."""
+    vector_store = open_vector_store(str(tmp_path / "chroma"), HashEmbedder())
+    ingest_html(MINI_10K, fake_filing("ACME"), vector_store)
+    ingest_html(MINI_10K, fake_filing("OTHER"), vector_store)
+    return vector_store

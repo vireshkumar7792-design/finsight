@@ -17,54 +17,44 @@ BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 # =========================
 
 
-class LocalEmbedder:
-    """Turns text into 384 numbers so similar meanings end up close together.
+def make_embeddings(model_name: str):
+    """A local sentence-transformers model (~130 MB, downloaded once). No embedding API."""
+    from langchain_huggingface import HuggingFaceEmbeddings  # slow import (torch)
 
-    The model (~130 MB) is downloaded once and only loaded on first use, because loading is slow.
-    """
-
-    def __init__(self, model_name: str):
-        self.name = model_name
-        self.model = None
-
-    def load(self):
-        if self.model is None:
-            from sentence_transformers import SentenceTransformer
-
-            self.model = SentenceTransformer(self.name, device="cpu")
-        return self.model
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self.load().encode(texts, normalize_embeddings=True).tolist()
-
-    def embed_query(self, text: str) -> list[float]:
+    return HuggingFaceEmbeddings(
+        model_name=model_name,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
         # bge models were trained with this prefix on questions (not on documents).
-        return self.load().encode([BGE_QUERY_PREFIX + text], normalize_embeddings=True)[0].tolist()
+        query_encode_kwargs={"normalize_embeddings": True, "prompt": BGE_QUERY_PREFIX},
+    )
 
 
 # =========================
-# Chroma collection
+# Vector store
 # =========================
 
 
-def open_collection(chroma_path: str, embedder_name: str):
-    """Open (or create) the 10-K collection. We pass our own vectors, so Chroma never embeds."""
+def open_vector_store(chroma_path: str, embeddings):
+    """Open (or create) the 10-K store. `embeddings` must have a `model_name`."""
     import chromadb  # slow import: only when research or ingest runs
-    from chromadb.config import Settings as ChromaSettings
+    from langchain_chroma import Chroma
 
     Path(chroma_path).mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=chroma_path, settings=ChromaSettings(anonymized_telemetry=False))
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=None,
-        configuration={"hnsw": {"space": "cosine"}},
-        metadata={"embedding_model": embedder_name},
+    vector_store = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=chroma_path,
+        client_settings=chromadb.config.Settings(anonymized_telemetry=False),
+        collection_configuration={"hnsw": {"space": "cosine"}},
+        collection_metadata={"embedding_model": embeddings.model_name},
     )
     # Vectors from two different models can't be compared, so refuse a mismatch.
-    built_with = (collection.metadata or {}).get("embedding_model")
-    if built_with and built_with != embedder_name:
-        raise ValueError(f"the 10-K index was built with {built_with}, not {embedder_name}")
-    return collection
+    # LangChain has no public getter for collection metadata, hence `_collection`.
+    built_with = (vector_store._collection.metadata or {}).get("embedding_model")
+    if built_with and built_with != embeddings.model_name:
+        raise ValueError(f"the 10-K index was built with {built_with}, not {embeddings.model_name}")
+    return vector_store
 
 
 # =========================
@@ -72,42 +62,34 @@ def open_collection(chroma_path: str, embedder_name: str):
 # =========================
 
 
-def ingest_html(html: str, filing: dict, collection, embedder, force: bool = False) -> dict:
+def ingest_html(html: str, filing: dict, vector_store, force: bool = False) -> dict:
     """Parse, chunk, embed and store one filing. Returns a small status dict."""
     sections = split_sections(html_to_text(html))
     chunks = make_chunks(sections, filing)
-    result = {"ticker": filing["ticker"], "fiscal_year": filing["fiscal_year"],
-              "chunks": len(chunks), "sections": [section["key"] for section in sections]}
+    result = {"ticker": filing["ticker"], "fiscal_year": filing["fiscal_year"], "chunks": len(chunks),
+              "sections": [section.metadata["section_key"] for section in sections]}
     if not chunks:
         return {**result, "status": "error: no text found"}
 
-    new_ids = [chunk["id"] for chunk in chunks]
-    old_ids = collection.get(where={"accession": filing["accession"]}, include=[])["ids"]
+    new_ids = [chunk.id for chunk in chunks]
+    old_ids = vector_store.get(where={"accession": filing["accession"]}, include=[])["ids"]
     if set(old_ids) == set(new_ids) and not force:
         return {**result, "status": "already ingested"}  # skip the slow embedding step
 
     leftover_ids = [chunk_id for chunk_id in old_ids if chunk_id not in new_ids]
     if leftover_ids:
-        collection.delete(ids=leftover_ids)
-    for start in range(0, len(chunks), 64):  # in batches, to keep memory small
-        batch = chunks[start:start + 64]
-        texts = [chunk["text"] for chunk in batch]
-        collection.upsert(  # upsert = insert, or overwrite the same id
-            ids=[chunk["id"] for chunk in batch],
-            documents=texts,
-            metadatas=[chunk["metadata"] for chunk in batch],
-            embeddings=embedder.embed_documents(texts),
-        )
+        vector_store.delete(ids=leftover_ids)
+    vector_store.add_documents(chunks)  # Chroma upserts by Document.id, so nothing duplicates
     return {**result, "status": "ingested"}
 
 
-def ingest_ticker(ticker: str, user_agent: str, settings, collection, embedder, force: bool = False) -> dict:
+def ingest_ticker(ticker: str, user_agent: str, settings, vector_store, force: bool = False) -> dict:
     """Download and ingest one ticker. Errors are returned, so other tickers still run."""
     try:
         html, filing = download_10k(ticker, user_agent, settings.filings_dir)
     except (LookupError, httpx.HTTPError) as error:
         return {"ticker": ticker.upper(), "status": f"error: {error}", "chunks": 0, "sections": []}
-    return ingest_html(html, filing, collection, embedder, force)
+    return ingest_html(html, filing, vector_store, force)
 
 
 def sample_equity_tickers(samples_dir: str = "data/samples") -> list[str]:
