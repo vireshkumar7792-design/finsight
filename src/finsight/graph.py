@@ -26,10 +26,9 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
-from finsight.agents.portfolio import make_portfolio_node
 from finsight.agents.report import make_report_node
-from finsight.agents.research import research_node
-from finsight.agents.risk import make_risk_node
+from finsight.agents.research import make_research_node, research_deps_from_settings
+from finsight.agents.specialist import make_portfolio_node, make_risk_node
 from finsight.agents.supervisor import make_supervisor_node, route_after_supervisor
 from finsight.config import Settings, get_llm, get_settings
 from finsight.context import PortfolioContext
@@ -46,6 +45,7 @@ def build_graph(
     checkpointer: BaseCheckpointSaver | None = None,
     settings: Settings | None = None,
     interrupt_before: list[str] | None = None,
+    research_deps=None,
 ):
     """Compile the FinSight graph. Pass fake models in tests; defaults come from get_llm(role)."""
     s = settings or get_settings()
@@ -57,7 +57,16 @@ def build_graph(
     g.add_node("supervisor", make_supervisor_node(router))
     g.add_node("portfolio", make_portfolio_node(agent_model))
     g.add_node("risk", make_risk_node(agent_model))
-    g.add_node("research", research_node)
+    # Research deps load lazily (embedder ~seconds) and only if a question routes to research.
+    deps = research_deps
+
+    def deps_provider():
+        nonlocal deps
+        if deps is None:
+            deps = research_deps_from_settings(s)
+        return deps
+
+    g.add_node("research", make_research_node(agent_model, report_model, deps_provider))
     g.add_node("report", make_report_node(report_model))
 
     g.add_edge(START, "supervisor")
@@ -104,9 +113,23 @@ def _stream(graph, graph_input, thread_id: str, ctx: PortfolioContext, on_update
 def run_question(graph, ctx: PortfolioContext, question: str, thread_id: str, portfolio_source: str,
                  on_update: UpdateCallback | None = None):
     """Ask a (new or follow-up) question on a thread. Returns the final StateSnapshot."""
-    return _stream(graph, new_question_input(question, portfolio_source), thread_id, ctx, on_update)
+    graph_input = new_question_input(question, portfolio_source, data_as_of=ctx.as_of)
+    return _stream(graph, graph_input, thread_id, ctx, on_update)
+
+
+def is_stale(graph, ctx: PortfolioContext, thread_id: str) -> bool:
+    """True if the thread's saved findings used market data from a different day than `ctx`."""
+    saved = graph.get_state(thread_config(thread_id)).values.get("data_as_of")
+    return bool(saved) and saved != ctx.as_of
 
 
 def resume_thread(graph, ctx: PortfolioContext, thread_id: str, on_update: UpdateCallback | None = None):
-    """Continue an unfinished run from its last checkpoint (input=None means 'resume')."""
+    """Continue an unfinished run from its last checkpoint (input=None means 'resume').
+
+    If the saved findings used a different day's prices than `ctx`, continuing would mix two
+    days' data in one report, so the same question is re-asked from scratch instead.
+    """
+    if is_stale(graph, ctx, thread_id):
+        values = graph.get_state(thread_config(thread_id)).values
+        return run_question(graph, ctx, values["question"], thread_id, values["portfolio_source"], on_update)
     return _stream(graph, None, thread_id, ctx, on_update)

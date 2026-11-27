@@ -32,6 +32,13 @@ Provider = Literal["groq", "openrouter"]
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 FREE_SUFFIX = ":free"
 
+# Fixed LLM call behavior (not worth an env var each).
+TEMPERATURE = 0.0  # deterministic-ish: analysis, not creativity
+MAX_RETRIES = 5  # SDK-level exponential backoff; honors 429 Retry-After headers
+REQUEST_TIMEOUT_SECONDS = 90.0  # generous because the rate limiter may queue us
+EST_TOKENS_PER_CALL = 2500  # tokens the limiter reserves before a call (actual usage recorded after)
+OPENROUTER_RPM = 20  # OpenRouter ":free" models: 20 requests/minute (limits requests only)
+
 
 class MissingAPIKeyError(RuntimeError):
     """A provider key needed for the requested role is not configured."""
@@ -49,6 +56,9 @@ class Settings(BaseSettings):
     # Provider keys (standard names, no prefix). Never print these.
     groq_api_key: SecretStr | None = Field(default=None, validation_alias="GROQ_API_KEY")
     openrouter_api_key: SecretStr | None = Field(default=None, validation_alias="OPENROUTER_API_KEY")
+    tavily_api_key: SecretStr | None = Field(default=None, validation_alias="TAVILY_API_KEY")
+    # SEC asks for "Name contact@email" in the User-Agent. Personal info: SecretStr, never printed.
+    sec_user_agent: SecretStr | None = Field(default=None, validation_alias="SEC_USER_AGENT")
 
     # Provider + model per role. Verified free (Nov 2026): Groq free plan; OpenRouter ":free" ids.
     router_provider: Provider = "groq"
@@ -61,16 +71,10 @@ class Settings(BaseSettings):
     # Cost guard: refuse non-":free" OpenRouter models unless explicitly allowed.
     allow_paid: bool = False
 
-    # Free-tier limits (measured from Groq response headers; OpenRouter docs for :free models).
+    # Groq free-tier limits per model (measured from response headers; Groq may change them).
     groq_rpm: int = 30
     groq_tpm: int = 8000
-    openrouter_rpm: int = 20
-    est_tokens_per_call: int = 2500  # reserve used by the token limiter before a call
 
-    # LLM call behavior
-    temperature: float = 0.0  # deterministic-ish: analysis, not creativity
-    max_retries: int = 5  # SDK-level exponential backoff; honors 429 Retry-After headers
-    request_timeout: float = 90.0  # seconds; generous because the limiter may queue us
     # Cap on output tokens per call. OpenRouter checks you can afford max_tokens BEFORE a request.
     max_output_tokens: int = 2000
     reasoning_effort: str = "low"  # gpt-oss models: fewer hidden reasoning tokens = less TPM used
@@ -79,6 +83,15 @@ class Settings(BaseSettings):
     llm_cache: bool = False
     llm_cache_path: str = "data/cache/llm_cache.sqlite"
     checkpoint_path: str = "data/checkpoints/finsight.sqlite"
+    # Same-day market data cache (prices per calendar day, sectors for 30 days)
+    market_cache_dir: str = "data/cache/market"
+
+    # Research (Phase 4): local embeddings + Chroma + Tavily free tier + SEC EDGAR
+    embedding_model: str = "BAAI/bge-small-en-v1.5"  # local, 384-dim, 512-token window
+    chroma_path: str = "data/chroma"
+    filings_dir: str = "data/filings"
+    tavily_cache_dir: str = "data/cache/tavily"
+    # Per-question search caps are constants in agents/research_tools.py (cost policy).
 
     # Analysis constants
     risk_free_rate: float = 0.04  # annual, as a fraction
@@ -116,18 +129,18 @@ def check_cost_guard(provider: Provider, model: str, allow_paid: bool) -> None:
 
 
 # One limiter per (provider, model): roles sharing a model share its quota.
-_LIMITERS: dict[tuple[str, str], FreeTierRateLimiter] = {}
+LIMITERS: dict[tuple[str, str], FreeTierRateLimiter] = {}
 _CACHES: dict[str, SQLiteLLMCache] = {}
 
 
 def get_rate_limiter(provider: Provider, model: str, s: Settings) -> FreeTierRateLimiter:
     key = (provider, model)
-    if key not in _LIMITERS:
+    if key not in LIMITERS:
         if provider == "groq":
-            _LIMITERS[key] = FreeTierRateLimiter(s.groq_rpm, s.groq_tpm, s.est_tokens_per_call)
+            LIMITERS[key] = FreeTierRateLimiter(s.groq_rpm, s.groq_tpm, EST_TOKENS_PER_CALL)
         else:
-            _LIMITERS[key] = FreeTierRateLimiter(s.openrouter_rpm, None)  # OpenRouter limits requests only
-    return _LIMITERS[key]
+            LIMITERS[key] = FreeTierRateLimiter(OPENROUTER_RPM, None)  # OpenRouter limits requests only
+    return LIMITERS[key]
 
 
 def get_cache(s: Settings) -> SQLiteLLMCache | None:
@@ -152,9 +165,9 @@ def get_llm(role: Role, settings: Settings | None = None) -> BaseChatModel:
     limiter = get_rate_limiter(provider, model, s)
     common = dict(
         model=model,
-        temperature=s.temperature,
-        max_retries=s.max_retries,
-        timeout=s.request_timeout,
+        temperature=TEMPERATURE,
+        max_retries=MAX_RETRIES,
+        timeout=REQUEST_TIMEOUT_SECONDS,
         max_tokens=s.max_output_tokens,
         rate_limiter=limiter,
         callbacks=[TokenLedger(limiter)],

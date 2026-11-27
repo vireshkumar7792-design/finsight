@@ -9,7 +9,6 @@ Fixture (see conftest): AAPL 10 @ $100 -> $150, MSFT 5 @ $200 -> $180.
 
 import pytest
 
-from finsight.schemas.portfolio import Holding, Portfolio
 from finsight.tools import portfolio_math as pm
 
 
@@ -47,19 +46,3 @@ def test_allocation_by_group_sums_sorts_and_defaults_unknown():
     alloc = pm.allocation_by_group(weights, {"A": "Tech", "B": "Health", "C": "Energy"})
     assert list(alloc) == ["Energy", "Health", "Tech"]  # 0.5, 0.3, 0.2
 
-
-def test_asset_type_allocation():
-    # Equity 10*$10 = 100, bond ETF 30*$10 = 300 -> equity 0.25, bond 0.75
-    p = Portfolio(
-        holdings=[
-            Holding(ticker="X", quantity=10, avg_buy_price=5, asset_type="equity"),
-            Holding(ticker="BND", quantity=30, avg_buy_price=5, asset_type="bond"),
-        ]
-    )
-    alloc = pm.asset_type_allocation(p, {"X": 10, "BND": 10})
-    assert alloc == pytest.approx({"bond": 0.75, "equity": 0.25})
-
-
-def test_sector_allocation(two_stock_portfolio, two_stock_prices):
-    alloc = pm.sector_allocation(two_stock_portfolio, two_stock_prices, {"AAPL": "Tech", "MSFT": "Tech"})
-    assert alloc == pytest.approx({"Tech": 1.0})

@@ -20,12 +20,12 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from finsight.agents.analyst import message_text
-from finsight.agents.structured import structured_invoke
+from finsight.agents.structured import message_text, structured_invoke
 from finsight.schemas.report import Report
 from finsight.state import FINDING_KEYS, FinSightState, prior_conversation
 
 DISCLAIMER = "FinSight is an analysis tool, not a financial advisor. Not financial advice."
+STRUCTURED_ATTEMPTS = 2  # 1 try + 1 retry before the plain-text fallback
 
 REPORT_PROMPT = """You are the Report writer for FinSight, a portfolio analysis tool. Write a clear, \
 concise report answering the user's question using ONLY the findings provided.
@@ -39,7 +39,8 @@ Compare by stating both figures (e.g. "44.43% vs 14.95% for SPY").
 (e.g. "risk:get_risk_metrics"). unit: "%" for _pct, "USD" for _usd, "ratio" otherwise.
 - sections: 1-4 short sections with plain-language interpretation; compare with the benchmark when \
 the data includes one.
-- If a finding is marked as a stub or an agent failed, say so in caveats; never fill the gap yourself.
+- Research findings contain cited insights: when you use one, keep its source ids in square brackets after the sentence, e.g. "... export controls [NVDA-10K-FY2026-1A-004]". Never cite ids that aren't there.
+- If an agent failed or research lists gaps, say so in caveats; never fill the gap yourself.
 - Describe and interpret; do not recommend buying or selling.
 - Mention the data's as_of date in the summary."""
 
@@ -79,7 +80,7 @@ def enforce_traceability(report: Report, findings: dict[str, dict[str, Any]]) ->
 
 def _build_messages(state: FinSightState, findings: dict[str, dict[str, Any]]) -> list:
     compact = {
-        agent: {"summary": f["summary"], "is_stub": f.get("is_stub", False), "data": f["data"]}
+        agent: {"summary": f["summary"], "data": f["data"]}
         for agent, f in findings.items()
     }
     body = (
@@ -105,7 +106,7 @@ def deterministic_report(state: FinSightState, findings: dict[str, dict[str, Any
     })
 
 
-def make_report_node(llm: BaseChatModel, max_structured_attempts: int = 2):
+def make_report_node(llm: BaseChatModel):
     def report(state: FinSightState) -> dict[str, Any]:
         findings = collect_findings(state)
         messages = _build_messages(state, findings)
@@ -114,7 +115,7 @@ def make_report_node(llm: BaseChatModel, max_structured_attempts: int = 2):
         result: Report | None = None
         mode = "structured"
 
-        for _ in range(max_structured_attempts):  # 1 try + 1 retry
+        for _ in range(STRUCTURED_ATTEMPTS):
             calls += 1
             try:
                 result = structured_invoke(llm, Report, messages)

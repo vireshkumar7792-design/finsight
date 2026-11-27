@@ -78,16 +78,3 @@ def allocation_by_group(weights: Mapping[str, float], groups: Mapping[str, str])
         label = groups.get(ticker) or "Unknown"
         totals[label] = totals.get(label, 0.0) + w
     return dict(sorted(totals.items(), key=lambda kv: kv[1], reverse=True))
-
-
-def asset_type_allocation(portfolio: Portfolio, prices: Mapping[str, float]) -> dict[str, float]:
-    """Weight by asset_type (equity/etf/bond/crypto/cash)."""
-    groups = {h.ticker: h.asset_type.value for h in portfolio.holdings}
-    return allocation_by_group(portfolio_weights(portfolio, prices), groups)
-
-
-def sector_allocation(
-    portfolio: Portfolio, prices: Mapping[str, float], sectors: Mapping[str, str]
-) -> dict[str, float]:
-    """Weight by sector. `sectors` maps ticker -> sector (from market_data.get_sectors)."""
-    return allocation_by_group(portfolio_weights(portfolio, prices), sectors)

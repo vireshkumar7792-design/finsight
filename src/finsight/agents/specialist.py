@@ -1,4 +1,4 @@
-"""Shared machinery for specialist agents (Portfolio, Risk).
+"""The Portfolio and Risk specialist agents, and the machinery they share.
 
 Each specialist is a small ReAct agent (LangChain create_agent) restricted to its own tools.
 After it runs, we DON'T keep its chat transcript. We turn it into a compact Finding:
@@ -23,9 +23,20 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 
-from finsight.agents.analyst import message_text
+from finsight.agents.structured import message_text
+from finsight.agents.tools import (
+    allocation_payload,
+    correlations_payload,
+    get_allocation,
+    get_correlations,
+    get_portfolio_summary,
+    get_position_detail,
+    get_risk_metrics,
+    risk_payload,
+    summary_payload,
+)
 from finsight.context import PortfolioContext
-from finsight.schemas.findings import AgentName, Finding, ToolCallInfo, source_id
+from finsight.schemas.findings import AgentName, Finding, source_id
 from finsight.state import FINDING_KEYS, FinSightState, prior_conversation
 
 SPECIALIST_RULES = """
@@ -44,11 +55,11 @@ def finding_from_messages(agent: AgentName, messages: list, defaults_used: list[
     """Pair each tool call with its ToolMessage result and build a Finding."""
     results = {m.tool_call_id: m.content for m in messages if isinstance(m, ToolMessage)}
     data: dict[str, Any] = {}
-    called: list[ToolCallInfo] = []
+    called: list[dict[str, Any]] = []
     for m in messages:
         if isinstance(m, AIMessage):
             for tc in m.tool_calls:
-                called.append(ToolCallInfo(name=tc["name"], args=tc["args"]))
+                called.append({"name": tc["name"], "args": tc["args"]})
                 raw = results.get(tc["id"], "")
                 try:
                     data[source_id(agent, tc["name"], tc["args"])] = json.loads(raw)
@@ -95,14 +106,46 @@ def make_specialist_node(
         if not finding.data:  # model skipped tools: fetch default data deterministically
             for name, args, payload_fn in default_tools:
                 finding.data[source_id(agent, name, args)] = payload_fn(runtime.context)
-                finding.tools_called.append(ToolCallInfo(name=name, args=args))
+                finding.tools_called.append({"name": name, "args": args})
             finding.summary += " [Note: model called no tools; default tool data attached automatically.]"
 
         return {
             FINDING_KEYS[agent]: finding.model_dump(),
             "completed_agents": [agent],
-            "tool_calls": [{"agent": agent, "name": t.name, "args": t.args} for t in finding.tools_called],
+            "tool_calls": [{"agent": agent, **t} for t in finding.tools_called],
             "llm_calls": n_llm,
         }
 
     return node
+
+
+# ---- the two specialists ------------------------------------------------------------------------
+
+PORTFOLIO_PROMPT = """You are the Portfolio specialist in a team of analysts. You cover holdings, \
+total value, weights, gains/losses (P&L) and allocation by sector or asset type. Other specialists \
+cover risk and company research; ignore those parts of the question."""
+
+PORTFOLIO_TOOLS = [get_portfolio_summary, get_allocation, get_position_detail]
+PORTFOLIO_DEFAULTS = [
+    ("get_portfolio_summary", {}, summary_payload),
+    ("get_allocation", {"by": "sector"}, lambda ctx: allocation_payload(ctx, "sector")),
+]
+
+RISK_PROMPT = """You are the Risk specialist in a team of analysts. You cover volatility, Sharpe \
+ratio, beta, Value at Risk, max drawdown, concentration (HHI, largest position) and how holdings \
+correlate (diversification). Compare against the benchmark figures the tools provide. Other \
+specialists cover holdings/P&L and company research; ignore those parts of the question."""
+
+RISK_TOOLS = [get_risk_metrics, get_correlations, get_position_detail]
+RISK_DEFAULTS = [
+    ("get_risk_metrics", {}, risk_payload),
+    ("get_correlations", {}, correlations_payload),
+]
+
+
+def make_portfolio_node(model: BaseChatModel):
+    return make_specialist_node("portfolio", model, PORTFOLIO_TOOLS, PORTFOLIO_PROMPT, PORTFOLIO_DEFAULTS)
+
+
+def make_risk_node(model: BaseChatModel):
+    return make_specialist_node("risk", model, RISK_TOOLS, RISK_PROMPT, RISK_DEFAULTS)

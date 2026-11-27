@@ -1,8 +1,9 @@
-"""Structured-output helper shared by the supervisor and report agents.
+"""Helpers for reading LLM output, shared by all agents.
 
-Free models are less reliable at structured output, so every failure mode (provider error,
-invalid JSON, schema mismatch, empty result) becomes one exception type the caller can
-catch and fall back from.
+structured_invoke: free models are less reliable at structured output, so every failure mode
+(provider error, invalid JSON, schema mismatch, empty result) becomes one exception type the
+caller can catch and fall back from.
+message_text: the plain text of an AI message.
 """
 
 from __future__ import annotations
@@ -10,10 +11,17 @@ from __future__ import annotations
 from typing import TypeVar
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage
 from pydantic import BaseModel, ValidationError
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def message_text(msg: AIMessage) -> str:
+    """Final text of an AI message (content may be a string or a list of content blocks)."""
+    if isinstance(msg.content, str):
+        return msg.content
+    return "".join(b.get("text", "") for b in msg.content if isinstance(b, dict) and b.get("type") == "text")
 
 
 class StructuredOutputError(RuntimeError):

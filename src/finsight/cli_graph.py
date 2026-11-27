@@ -16,9 +16,9 @@ import sys
 import uuid
 from typing import Any
 
-from finsight.config import _LIMITERS, MissingAPIKeyError, PaidModelRefusedError, get_settings
+from finsight.config import LIMITERS, MissingAPIKeyError, PaidModelRefusedError, get_settings
 from finsight.context import PortfolioContext
-from finsight.graph import build_graph, open_checkpointer, resume_thread, run_question, thread_config
+from finsight.graph import build_graph, is_stale, open_checkpointer, resume_thread, run_question, thread_config
 from finsight.schemas.report import render_report
 from finsight.tools.csv_loader import PortfolioValidationError
 
@@ -50,13 +50,19 @@ def print_summary(snap) -> None:
     route = " -> ".join(["supervisor"] + [x for e in v.get("route_log", []) for x in (e["to"], "supervisor")][:-1])
     print("\n" + "=" * 76)
     print(f"Path: {route}")
-    waited = sum(lim.total_wait_seconds for lim in _LIMITERS.values())
+    waited = sum(lim.total_wait_seconds for lim in LIMITERS.values())
     print(f"LLM calls this question: {v.get('llm_calls', 0)} | rate-limit waits: {waited:.1f}s")
     if v.get("errors"):
         print("Errors:\n  - " + "\n  - ".join(v["errors"]))
     print("=" * 76 + "\n")
     if v.get("report"):
         print(render_report(v["report"]))
+        research = ((v.get("research_findings") or {}).get("data") or {}).get("research:findings")
+        if research and research.get("sources"):
+            print("\nResearch sources:")
+            for src in research["sources"]:
+                where = src.get("section") or src.get("published_date") or ""
+                print(f"  [{src['id']}] {src['title']} | {where}\n      {src['url']}")
     elif snap.next:
         print(f"Run is unfinished (next: {', '.join(snap.next)}). Continue with --resume.")
 
@@ -80,6 +86,7 @@ def show_state(graph, thread_id: str) -> int:
         "next_nodes": list(snap.next),
         "question": v.get("question"),
         "portfolio_source": v.get("portfolio_source"),
+        "data_as_of": v.get("data_as_of"),
         "plan": v.get("plan"),
         "route_log": v.get("route_log"),
         "completed_agents": v.get("completed_agents"),
@@ -140,6 +147,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Models: router={settings.router_model} | agent={settings.agent_model} | report={settings.report_model}\n")
 
         if args.resume:
+            if is_stale(graph, ctx, thread_id):
+                saved = graph.get_state(thread_config(thread_id)).values["data_as_of"]
+                print(f"Note: this run started on market data from {saved}; current data is {ctx.as_of}.\n"
+                      "Re-running the question from scratch so the report doesn't mix two days' prices.\n")
             snap = resume_thread(graph, ctx, thread_id, on_update=print_update)
         else:
             pending = graph.get_state(thread_config(thread_id)).next

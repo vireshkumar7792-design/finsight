@@ -17,6 +17,7 @@ from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 
+from finsight.agents.structured import message_text
 from finsight.agents.tools import ALL_TOOLS
 from finsight.config import Role, get_llm
 from finsight.context import PortfolioContext
@@ -67,13 +68,6 @@ class AnalystResult:
     messages: list[AnyMessage]
 
 
-def message_text(msg: AIMessage) -> str:
-    """Final text of an AI message (content may be a string or a list of content blocks)."""
-    if isinstance(msg.content, str):
-        return msg.content
-    return "".join(b.get("text", "") for b in msg.content if isinstance(b, dict) and b.get("type") == "text")
-
-
 def ask(question: str, ctx: PortfolioContext, agent=None) -> AnalystResult:
     """Run one question through the agent and collect the answer plus a tool-call trace."""
     agent = agent or build_analyst()
@@ -90,5 +84,3 @@ def ask(question: str, ctx: PortfolioContext, agent=None) -> AnalystResult:
     final = next((m for m in reversed(messages) if isinstance(m, AIMessage) and not m.tool_calls), None)
     return AnalystResult(answer=message_text(final) if final else "", tool_calls=calls, messages=messages)
 
-
-_text = message_text  # backwards-compatible alias

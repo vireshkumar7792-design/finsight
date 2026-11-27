@@ -4,7 +4,8 @@ Built once per run (CSV + one batched price download + sector lookup), then hand
 tool call via LangChain's runtime context, so tools never re-download and the LLM never
 has to pass portfolio data around as arguments.
 
-Fetchers are injectable: production uses yfinance (tools/market_data.py), tests pass fakes.
+Fetchers are injectable: production uses a same-day disk cache over yfinance
+(tools/market_cache.py), tests pass fakes.
 """
 
 from __future__ import annotations
@@ -19,8 +20,9 @@ import pandas as pd
 from finsight.config import Settings, get_settings
 from finsight.schemas.metrics import PortfolioSummary
 from finsight.schemas.portfolio import CASH_PRICE, Portfolio
-from finsight.tools import market_data, portfolio_math, risk_math
+from finsight.tools import portfolio_math, risk_math
 from finsight.tools.csv_loader import load_portfolio_csv
+from finsight.tools.market_cache import MarketDataCache
 
 CASH_SECTOR_LABEL = "Cash"
 
@@ -47,11 +49,19 @@ class PortfolioContext:
         portfolio: Portfolio,
         settings: Settings | None = None,
         *,
-        fetch_history: HistoryFetcher = market_data.get_price_history,
-        fetch_sectors: SectorFetcher = market_data.get_sectors,
+        fetch_history: HistoryFetcher | None = None,
+        fetch_sectors: SectorFetcher | None = None,
     ) -> PortfolioContext:
-        """Fetch market data for `portfolio` (one batched history download incl. benchmark)."""
+        """Fetch market data for `portfolio` (one batched history download incl. benchmark).
+
+        By default data comes from the same-day disk cache over yfinance (delete
+        data/cache/market/ to force a fresh download). Tests pass their own fetchers.
+        """
         s = settings or get_settings()
+        if fetch_history is None or fetch_sectors is None:
+            cache = MarketDataCache(s.market_cache_dir)
+            fetch_history = fetch_history or cache.get_price_history
+            fetch_sectors = fetch_sectors or cache.get_sectors
         bench = s.benchmark_ticker.upper()
         market = portfolio.market_tickers  # cash is never sent to yfinance
 

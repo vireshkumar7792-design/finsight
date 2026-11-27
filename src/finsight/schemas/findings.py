@@ -17,17 +17,11 @@ from pydantic import BaseModel, Field
 AgentName = Literal["portfolio", "risk", "research"]
 
 
-class ToolCallInfo(BaseModel):
-    name: str
-    args: dict[str, Any] = Field(default_factory=dict)
-
-
 class Finding(BaseModel):
     agent: AgentName
     summary: str
     data: dict[str, Any] = Field(default_factory=dict)  # source_id -> parsed tool payload
-    tools_called: list[ToolCallInfo] = Field(default_factory=list)
-    is_stub: bool = False
+    tools_called: list[dict[str, Any]] = Field(default_factory=list)  # [{"name": ..., "args": ...}]
 
 
 def source_id(agent: str, tool_name: str, args: dict[str, Any]) -> str:

@@ -5,7 +5,10 @@ from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 
 from finsight.config import (
+    MAX_RETRIES,
     OPENROUTER_BASE_URL,
+    OPENROUTER_RPM,
+    TEMPERATURE,
     MissingAPIKeyError,
     PaidModelRefusedError,
     Settings,
@@ -27,10 +30,10 @@ def test_all_roles_default_to_groq_free_tier(test_settings, role):
     llm = get_llm(role, test_settings)
     assert isinstance(llm, ChatGroq)
     assert llm.model_name == test_settings.model_for(role)
-    assert llm.max_retries == test_settings.max_retries
+    assert llm.max_retries == MAX_RETRIES
     assert llm.max_tokens == test_settings.max_output_tokens
     # ChatGroq swaps temperature 0 for 1e-8 (Groq's API treats exactly 0 specially).
-    assert llm.temperature == pytest.approx(test_settings.temperature, abs=1e-6)
+    assert llm.temperature == pytest.approx(TEMPERATURE, abs=1e-6)
 
 
 def test_default_models():
@@ -76,7 +79,7 @@ def test_free_openrouter_model_allowed():
     llm = get_llm("agent", s)
     assert isinstance(llm, ChatOpenAI)
     assert llm.openai_api_base == OPENROUTER_BASE_URL
-    assert llm.rate_limiter.rpm == s.openrouter_rpm
+    assert llm.rate_limiter.rpm == OPENROUTER_RPM
 
 
 def test_paid_allowed_only_with_explicit_flag(monkeypatch):

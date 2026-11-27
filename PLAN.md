@@ -19,8 +19,10 @@ Bottom-up. A phase starts only when the previous phase's tests pass.
   - Done when: offline `uv run pytest` passes; on FREE models, sector (balanced), risky (concentrated_risky), diversified+performance (tech_heavy, portfolio+risk) and "Research NVDA" (stub) run end-to-end with sensible routes; a killed run resumes by thread_id.
   - Measured: 2 LLM calls (research stub), 4 (one specialist), 6 (two specialists); ~1.3K / 4-5K / 8-10K tokens.
 
-- [ ] **Phase 4: Research agent — 10-K RAG + Tavily, cited schemas**
+- [ ] **Phase 4: Research agent — 10-K RAG + Tavily, cited schemas** (built, offline tests pass; real 10-K runs pending SEC_USER_AGENT)
   - Ingest 10-Ks into Chroma with local embeddings; retriever with citation metadata; Tavily search; `Insight`/`Source` schemas.
+  - Wired into the Phase 3 graph (`research` node replaces the stub; deps load lazily). Standalone: `research_cli`.
+  - Remaining: set SEC_USER_AGENT, `python -m finsight.rag.ingest --from-samples`, then real Q1 (NVDA risks -> Item 1A) and Q3 (Apple competition + news).
   - Done when: Research returns Insights that each carry ≥1 Source (chunk id or URL), retrieval is tested on a small fixture corpus, and the stub is replaced in the graph.
 
 - [ ] **Phase 5: Move tools to MCP servers**

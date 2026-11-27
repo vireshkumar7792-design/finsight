@@ -10,8 +10,10 @@ REDUCERS: when a node returns {"key": value}, LangGraph merges it into state.
 WHAT IS NOT IN STATE: PortfolioContext. It holds DataFrames and would bloat (or fail to
 serialize into) every checkpoint. It is passed per run via `context=` (LangGraph runtime
 context), like Phase 2. Tradeoff: on resume the context must be rebuilt, so we store the
-CSV path (`portfolio_source`) in state and reload it. Findings keep the numbers they used,
-with an `as_of` date, so a resumed run never mixes two days' prices silently.
+CSV path (`portfolio_source`) in state and reload it. The rebuilt context may hold NEWER
+market data than the findings already saved, so `data_as_of` (date of the prices a question
+started with) is stored too, and graph.resume_thread() never mixes dates: on a different day it
+re-runs the question on the new data.
 """
 
 from __future__ import annotations
@@ -44,6 +46,7 @@ class FinSightState(TypedDict, total=False):
     # The current question and where the portfolio came from (used to rebuild context on resume).
     question: str
     portfolio_source: str
+    data_as_of: str | None  # market-data date (YYYY-MM-DD) this question's findings are based on
     # Supervisor's plan for this question: {"agents": [...], "reason": str, "source": "llm"|"fallback"}
     plan: dict[str, Any] | None
     next_agent: str | None
@@ -66,12 +69,13 @@ class FinSightState(TypedDict, total=False):
 FINDING_KEYS = {"portfolio": "portfolio_findings", "risk": "risk_findings", "research": "research_findings"}
 
 
-def new_question_input(question: str, portfolio_source: str) -> dict[str, Any]:
+def new_question_input(question: str, portfolio_source: str, data_as_of: str | None = None) -> dict[str, Any]:
     """Graph input for a new question: append it to the conversation, reset per-question fields."""
     return {
         "messages": [HumanMessage(content=question)],
         "question": question,
         "portfolio_source": portfolio_source,
+        "data_as_of": data_as_of,
         "plan": None,
         "next_agent": None,
         "iteration": 0,

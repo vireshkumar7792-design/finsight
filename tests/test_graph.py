@@ -9,8 +9,9 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from tests.fakes import FakeLLM, ScriptExhausted, ai_tools, tool_call
 from finsight.agents.report import enforce_traceability
+from finsight.agents.research_tools import ResearchDeps
 from finsight.agents.supervisor import RouteDecision, make_supervisor_node, plan_from_decision
-from finsight.graph import build_graph, open_checkpointer, resume_thread, run_question, thread_config
+from finsight.graph import build_graph, is_stale, open_checkpointer, resume_thread, run_question, thread_config
 from finsight.schemas.report import KeyMetric, Report
 from finsight.state import MAX_ITERATIONS
 
@@ -35,8 +36,10 @@ def route(next_, then=(), reason="test route"):
 def make(test_settings, router=(), agent=(), report=(), report_script=(), **kw):
     r, a, p = FakeLLM(structured=list(router)), FakeLLM(script=list(agent)), FakeLLM(
         structured=list(report), script=list(report_script))
+    # Default: research has no sources configured, so it makes no LLM call (see test_research.py).
+    deps = kw.pop("research_deps", ResearchDeps(retriever=None, web=None))
     g = build_graph(router=r, agent_model=a, report_model=p, settings=test_settings,
-                    checkpointer=kw.pop("checkpointer", InMemorySaver()), **kw)
+                    checkpointer=kw.pop("checkpointer", InMemorySaver()), research_deps=deps, **kw)
     return g, r, a, p
 
 
@@ -87,13 +90,13 @@ def test_two_specialists_run_in_planned_order(fake_ctx, test_settings):
     assert v["report"]["key_metrics"][0]["name"] == "HHI"
 
 
-def test_research_routes_to_stub_without_llm(fake_ctx, test_settings):
+def test_research_without_sources_records_gap_without_llm(fake_ctx, test_settings):
     g, _, agent, _ = make(test_settings, router=[route("research")], report=[a_report(metrics=())])
     v = run_question(g, fake_ctx, "Research NVDA", "t3", "fake.csv").values
     assert path(v) == ["research", "report"]
-    rf = v["research_findings"]
-    assert rf["is_stub"] and rf["data"]["research:stub"]["requested_tickers"] == ["NVDA"]
-    assert "[STUB]" in rf["summary"]
+    rf = v["research_findings"]["data"]["research:findings"]
+    assert rf["tickers"] == ["NVDA"] and rf["insights"] == []
+    assert any("no research sources configured" in g for g in rf["gaps"])
     assert agent.n_calls == 0
     assert v["llm_calls"] == 2
 
@@ -213,7 +216,7 @@ def test_interrupted_run_resumes_from_checkpoint(fake_ctx, test_settings, tmp_pa
         g, *_ = make(test_settings, router=[route("research")], checkpointer=saver, interrupt_before=["report"])
         snap = run_question(g, fake_ctx, "Research NVDA", "resume-me", "fake.csv")
         assert snap.next == ("report",)
-        assert snap.values["research_findings"]["is_stub"]
+        assert snap.values["research_findings"]["agent"] == "research"
         assert snap.values.get("report") is None
 
     with open_checkpointer(db) as saver:  # run 2 (new process): continue, no router call needed
@@ -273,3 +276,52 @@ def test_specialist_transcript_is_not_checkpointed(fake_ctx, test_settings, tmp_
         run_question(g, fake_ctx, "sector?", "ns", "fake.csv")
     namespaces = {r[0] for r in sqlite3.connect(db).execute("select distinct checkpoint_ns from checkpoints")}
     assert namespaces == {""}  # only the parent graph; no 'portfolio:...' subgraph checkpoints
+
+
+# ---- stale data on resume ----------------------------------------------------------------------
+
+
+def _ctx_on_later_day(fake_portfolio, test_settings):
+    """Same portfolio, but market data ending a month later (like resuming on another day)."""
+    import pandas as pd
+
+    from finsight.context import PortfolioContext
+    from tests.conftest import FAKE_CLOSES, FAKE_SECTORS
+
+    def history(tickers, period):
+        idx = pd.date_range("2024-02-01", periods=4, name="Date")
+        return pd.DataFrame({t: FAKE_CLOSES[t] for t in tickers}, index=idx)
+
+    return PortfolioContext.load(fake_portfolio, test_settings, fetch_history=history,
+                                 fetch_sectors=lambda ts: {t: FAKE_SECTORS[t] for t in ts})
+
+
+def test_stale_resume_restarts_question_on_new_data(fake_ctx, fake_portfolio, test_settings, tmp_path):
+    db = tmp_path / "ckpt.sqlite"
+    with open_checkpointer(db) as saver:
+        g, *_ = make(test_settings, router=[route("research")], checkpointer=saver, interrupt_before=["report"])
+        snap = run_question(g, fake_ctx, "Research NVDA", "stale", "fake.csv")
+        assert snap.values["data_as_of"] == "2024-01-04"
+
+    later = _ctx_on_later_day(fake_portfolio, test_settings)
+    assert later.as_of == "2024-02-04"
+    with open_checkpointer(db) as saver:
+        g2, router2, _, _ = make(test_settings, router=[route("research")], report=[a_report(metrics=())],
+                                 checkpointer=saver)
+        assert is_stale(g2, later, "stale") and not is_stale(g2, fake_ctx, "stale")
+        snap = resume_thread(g2, later, "stale")
+    v = snap.values
+    assert snap.next == () and v["report"] is not None
+    assert v["data_as_of"] == "2024-02-04"
+    assert router2.n_calls == 1  # question re-planned from scratch on the new data
+    assert path(v) == ["research", "report"]  # fresh per-question log, not the old one + new
+
+
+def test_same_day_resume_is_unaffected(fake_ctx, test_settings, tmp_path):
+    db = tmp_path / "ckpt.sqlite"
+    with open_checkpointer(db) as saver:
+        g, *_ = make(test_settings, router=[route("research")], checkpointer=saver, interrupt_before=["report"])
+        run_question(g, fake_ctx, "Research NVDA", "same", "fake.csv")
+        g2, router2, _, _ = make(test_settings, report=[a_report(metrics=())], checkpointer=saver)
+        snap = resume_thread(g2, fake_ctx, "same")  # same day: continues, no re-plan
+    assert snap.next == () and router2.n_calls == 0

@@ -1,7 +1,10 @@
-"""Scripted fake chat model for offline graph tests (no API calls, no cost)."""
+"""Test fakes (no API calls, no cost): scripted chat model and a deterministic embedder."""
 
 from __future__ import annotations
 
+import hashlib
+import math
+import re
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -68,6 +71,32 @@ class FakeLLM(BaseChatModel):
     @property
     def n_calls(self) -> int:
         return len(self._calls) + len(self._structured_calls)
+
+
+class HashEmbedder:
+    """Deterministic bag-of-words embedding for offline tests: texts sharing words are close.
+
+    Not semantic (no synonyms), but it behaves like a real embedder for ranking tests.
+    Same two methods as finsight.rag.embeddings.LocalEmbedder.
+    """
+
+    name = "hash-test-embedder"
+
+    def __init__(self, dim: int = 64):
+        self.dim = dim
+
+    def _vec(self, text: str) -> list[float]:
+        v = [0.0] * self.dim
+        for w in re.findall(r"[a-z0-9]+", text.lower()):
+            v[int(hashlib.md5(w.encode()).hexdigest(), 16) % self.dim] += 1.0
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        return [x / norm for x in v]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._vec(t) for t in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._vec(text)
 
 
 def tool_call(name: str, args: dict | None = None, id: str | None = None) -> dict:

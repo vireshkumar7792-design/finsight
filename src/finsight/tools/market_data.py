@@ -1,4 +1,4 @@
-"""Market data access via yfinance: current prices, price history, sector info.
+"""Market data access via yfinance: price history and sector info.
 
 This is the ONLY module that touches the network. The raw yfinance calls are isolated in
 two tiny functions (`_download`, `_ticker_info`) so tests can monkeypatch them and exercise
@@ -47,16 +47,6 @@ def get_price_history(tickers: Sequence[str], period: str = "1y") -> pd.DataFram
     if missing:
         raise ValueError(f"no price data for: {', '.join(missing)}")
     return close[tickers].sort_index()
-
-
-def get_current_prices(tickers: Sequence[str]) -> dict[str, float]:
-    """Latest available adjusted close per ticker (one batched request, last 5 days).
-
-    Using the last close rather than a live quote keeps results reproducible within a day
-    and covers weekends/holidays.
-    """
-    history = get_price_history(tickers, period="5d")
-    return {t: float(history[t].dropna().iloc[-1]) for t in history.columns}
 
 
 def get_sectors(tickers: Sequence[str]) -> dict[str, str]:

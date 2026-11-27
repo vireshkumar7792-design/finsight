@@ -37,3 +37,21 @@ One line per decision: **what** we chose and **why**. Newest at the bottom. Phas
 - [P3] **PortfolioContext stays out of state** (DataFrames would bloat checkpoints); state stores `portfolio_source` so resume can rebuild it.
 - [P3] **State holds plain dicts (model_dump), not Pydantic objects**: checkpoints serialize cleanly and safely; Pydantic validates at the node boundaries.
 - [P3] **Custom resettable reducers** (`accumulate`, `add_or_reset`; `None` resets): per-question logs restart on a follow-up while `messages` keeps the conversation.
+- [P3] **Resume never mixes market-data dates**: state stores `data_as_of`; if today's data differs, `resume_thread` re-asks the question from scratch instead of continuing.
+- [P3] **Same-day market data cache** (JSON, not pickle): one Yahoo download per portfolio per day, so reruns are reproducible and Yahoo isn't rate-limiting us; sectors cached 30 days, "Unknown" never cached.
+- [P4] **Grounding enforced in code, not just the prompt**: the LLM writes a `ResearchDraft` (claims + source ids only); `Source` objects come only from what tools actually returned (`ResearchRunContext.sources`); `ResearchFindings` fails validation on any unknown id; the post-check drops claims left with no valid citation.
+- [P4] **Research is a fixed 2-call pipeline (tool selection -> structured synthesis), not create_agent**: a ReAct loop would add a 3rd call for an unused free-text summary. Worst case 5 calls (retry + notes -> structure).
+- [P4] **Tool model = agent role (Qwen, parallel calls); writer = report role (gpt-oss-120b, strict JSON)**: spreads tokens across two per-model 8K TPM budgets.
+- [P4] **Embeddings: local `BAAI/bge-small-en-v1.5`** over all-MiniLM-L6-v2: same size class and 384-dim, but a 512-token window (MiniLM truncates at 256) and retrieval-tuned; query prefix only on queries.
+- [P4] **We embed, Chroma stores** (`embedding_function=None`): the embedder is injectable (HashEmbedder in tests) and Chroma can't silently download its default model; collection records its embedding model and refuses a mismatch.
+- [P4] **Chroma telemetry off** (`anonymized_telemetry=False`): it's on by default.
+- [P4] **Sections by "longest-following-text" heading match**: each Item appears in the TOC and the body; the body occurrence is followed by far more text. Detection failure -> one "Full document" section with a warning.
+- [P4] **Index Items 1, 1A, 1C, 2, 3, 7, 7A only**: financial-statement tables (Item 8) chunk badly and numbers are our tools' job.
+- [P4] **Chunks of 220 words with 40 overlap (~300 tokens)**: fits bge's 512-token window; k=5 chunks trimmed to 1,200 chars keep the synthesis prompt ~2.3K tokens.
+- [P4] **Deterministic chunk ids + upsert = idempotent ingest**; already-ingested filings skip embedding entirely.
+- [P4] **Metadata filters before ranking** (ticker, section): similar text from another company must never be cited for the wrong ticker.
+- [P4] **Tavily: basic depth (1 credit), max 2 searches/question, disk cache, never raises**: quota/key/network failures become `gaps`, research continues on filings.
+- [P4] **News searches drop undated results and tavily.com profile pages; web queries use company names**: the first real run returned a quote page and a wrong-company ("TSLA - The Sales Leader Association") profile.
+- [P4] **SEC_USER_AGENT is a SecretStr**: it's personal contact info; it goes only into the request header.
+- [P4] **Funds and cash skipped at ingest**: ETFs/bond funds file N-CSR/N-PORT, not 10-Ks.
+- [Refactor] **Simplicity pass**: removed dead code and unused Phase 1 helpers; merged portfolio/risk agents into specialist.py; plain dicts instead of tiny classes (SourceRegistry, ToolCallInfo); fixed values (temperature, retries, timeouts, per-question search caps) are constants, not env settings, so cost caps can't be raised by accident.

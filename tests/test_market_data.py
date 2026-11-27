@@ -28,11 +28,6 @@ def test_price_history_reshapes_to_close_columns(monkeypatch):
     assert h["AAPL"].tolist() == [1.0, 2.0]
 
 
-def test_current_prices_use_last_non_missing_close(monkeypatch):
-    monkeypatch.setattr(md, "_download", fake_download({"AAPL": [1.0, 2.0, None], "SPY": [3.0, 4.0, 5.0]}))
-    assert md.get_current_prices(["AAPL", "SPY"]) == {"AAPL": 2.0, "SPY": 5.0}
-
-
 def test_unknown_ticker_raises(monkeypatch):
     monkeypatch.setattr(md, "_download", fake_download({"AAPL": [1.0, 2.0], "ZZZZ": [None, None]}))
     with pytest.raises(ValueError, match="no price data for: ZZZZ"):
@@ -74,6 +69,6 @@ def test_sectors(monkeypatch):
 @pytest.mark.network
 def test_live_yfinance_smoke():
     """Guards against yfinance changing its output shape under us."""
-    prices = md.get_current_prices(["AAPL", "SPY"])
-    assert set(prices) == {"AAPL", "SPY"} and all(p > 0 for p in prices.values())
+    history = md.get_price_history(["AAPL", "SPY"], "5d")
+    assert list(history.columns) == ["AAPL", "SPY"] and (history.dropna() > 0).all().all()
     assert md.get_sectors(["AAPL", "SPY"]) == {"AAPL": "Technology", "SPY": md.ETF_SECTOR_LABEL}
