@@ -1,102 +1,90 @@
-"""Shared graph state (FinSightState) and its reducers.
+"""What the graph remembers (FinSightState, saved in checkpoints) and what each run is given (RunContext)."""
 
-REDUCERS: when a node returns {"key": value}, LangGraph merges it into state.
-  - No reducer  -> overwrite (last write wins). Used for single values: plan, report, ...
-  - add_messages -> append (and update by message id). Conversation memory across questions.
-  - accumulate  -> append lists; an explicit None RESETS to []. Per-question logs use this, so
-                   a new question on the same thread can start clean while messages persist.
-  - add_or_reset -> integer counter; None resets to 0.
-
-WHAT IS NOT IN STATE: PortfolioContext. It holds DataFrames and would bloat (or fail to
-serialize into) every checkpoint. It is passed per run via `context=` (LangGraph runtime
-context), like Phase 2. Tradeoff: on resume the context must be rebuilt, so we store the
-CSV path (`portfolio_source`) in state and reload it. The rebuilt context may hold NEWER
-market data than the findings already saved, so `data_as_of` (date of the prices a question
-started with) is stored too, and graph.resume_thread() never mixes dates: on a different day it
-re-runs the question on the new data.
-"""
-
-from __future__ import annotations
-
+from dataclasses import dataclass
 from typing import Annotated, Any, TypedDict
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage, HumanMessage
 from langgraph.graph.message import add_messages
 
-MAX_ITERATIONS = 6  # supervisor visits per question before forcing the report
+from finsight.config import Settings
+from finsight.portfolio.context import PortfolioContext
+from finsight.tools.research_tools import ResearchSources
+
+# =========================
+# Graph state (checkpointed)
+# =========================
 
 
-def accumulate(old: list | None, new: list | None) -> list:
-    """List reducer: append `new`; `None` means reset to empty."""
-    if new is None:
-        return []
-    return [*(old or []), *new]
-
-
-def add_or_reset(old: int | None, new: int | None) -> int:
-    """Counter reducer: add `new`; `None` means reset to 0."""
-    if new is None:
-        return 0
-    return (old or 0) + new
-
-
-class FinSightState(TypedDict, total=False):
-    # Conversation memory (persists across questions on a thread): questions + final summaries.
+class FinSightState(TypedDict):
+    # Conversation memory: questions and short answers. add_messages APPENDS instead of
+    # replacing, so follow-up questions on the same thread see earlier turns.
     messages: Annotated[list[AnyMessage], add_messages]
-    # The current question and where the portfolio came from (used to rebuild context on resume).
+
+    # The current question. Every field below is reset when a new question starts.
     question: str
-    portfolio_source: str
-    data_as_of: str | None  # market-data date (YYYY-MM-DD) this question's findings are based on
-    # Supervisor's plan for this question: {"agents": [...], "reason": str, "source": "llm"|"fallback"}
-    plan: dict[str, Any] | None
-    next_agent: str | None
-    iteration: int
-    # Specialist outputs: Finding.model_dump() dicts (plain dicts checkpoint cleanly).
-    portfolio_findings: dict[str, Any] | None
-    risk_findings: dict[str, Any] | None
-    research_findings: dict[str, Any] | None
-    # Final output: Report.model_dump() plus how it was produced.
-    report: dict[str, Any] | None
-    report_mode: str | None  # "structured" | "plain_text_fallback" | "deterministic_fallback"
-    # Per-question accumulators (reset with None at the start of each question).
-    completed_agents: Annotated[list[str], accumulate]
-    errors: Annotated[list[str], accumulate]
-    route_log: Annotated[list[dict[str, Any]], accumulate]  # [{"to": ..., "reason": ...}]
-    tool_calls: Annotated[list[dict[str, Any]], accumulate]  # [{"agent", "name", "args"}]
-    llm_calls: Annotated[int, add_or_reset]
+    csv_path: str
+    data_as_of: str  # date of the market data this question was answered with
+
+    plan: list[str]  # agents the supervisor chose, in order
+    plan_reason: str
+    next_agent: str
+    completed_agents: list[str]
+    supervisor_visits: int
+
+    findings: dict[str, dict]  # agent name -> {"summary": ..., "data": {source_id: tool output}}
+    route_log: list[dict]  # [{"to": "risk", "reason": "..."}]
+    tool_calls: list[dict]  # [{"agent": "risk", "name": "get_risk_metrics", "args": {}}]
+    errors: list[str]
+    report: dict | None
 
 
-FINDING_KEYS = {"portfolio": "portfolio_findings", "risk": "risk_findings", "research": "research_findings"}
-
-
-def new_question_input(question: str, portfolio_source: str, data_as_of: str | None = None) -> dict[str, Any]:
-    """Graph input for a new question: append it to the conversation, reset per-question fields."""
+def new_question(question: str, csv_path: str, data_as_of: str) -> dict[str, Any]:
+    """Graph input for a new question: add it to the conversation and reset everything else."""
     return {
         "messages": [HumanMessage(content=question)],
         "question": question,
-        "portfolio_source": portfolio_source,
+        "csv_path": csv_path,
         "data_as_of": data_as_of,
-        "plan": None,
-        "next_agent": None,
-        "iteration": 0,
-        "portfolio_findings": None,
-        "risk_findings": None,
-        "research_findings": None,
+        "plan": [],
+        "plan_reason": "",
+        "next_agent": "",
+        "completed_agents": [],
+        "supervisor_visits": 0,
+        "findings": {},
+        "route_log": [],
+        "tool_calls": [],
+        "errors": [],
         "report": None,
-        "report_mode": None,
-        "completed_agents": None,  # None -> reducer resets to []
-        "errors": None,
-        "route_log": None,
-        "tool_calls": None,
-        "llm_calls": None,
     }
 
 
-def prior_conversation(state: FinSightState, max_turns: int = 2) -> str:
-    """Compact text of earlier Q&A on this thread (excluding the current question)."""
-    msgs = list(state.get("messages") or [])
-    if msgs and isinstance(msgs[-1], HumanMessage):
-        msgs = msgs[:-1]  # drop the current question
-    msgs = msgs[-2 * max_turns :]
-    lines = [f"{'User' if isinstance(m, HumanMessage) else 'FinSight'}: {m.content}" for m in msgs]
-    return "\n".join(lines) if lines else "(none)"
+def earlier_conversation(state: FinSightState, max_turns: int = 2) -> str:
+    """Last few question/answer turns as text, without the current question."""
+    messages = state["messages"][:-1]  # the last message is the current question
+    lines = []
+    for message in messages[-2 * max_turns:]:
+        speaker = "User" if isinstance(message, HumanMessage) else "FinSight"
+        lines.append(f"{speaker}: {message.content}")
+    return "\n".join(lines) or "(none)"
+
+
+# =========================
+# Run context (NOT checkpointed)
+# =========================
+
+
+@dataclass
+class RunContext:
+    """Handed to every node and tool for one run.
+
+    It holds DataFrames and model clients, which don't belong in checkpoints. On resume it
+    is rebuilt from state["csv_path"].
+    """
+
+    portfolio: PortfolioContext
+    router_llm: BaseChatModel
+    agent_llm: BaseChatModel
+    report_llm: BaseChatModel
+    settings: Settings
+    research: ResearchSources | None = None  # 10-K index + web search, opened on first research question

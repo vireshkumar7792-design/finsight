@@ -1,141 +1,120 @@
-"""Ingest the latest 10-K per ticker into Chroma: download -> clean text -> sections -> chunks -> embed.
+"""Ingest 10-Ks into Chroma: download -> parse -> chunk -> embed (locally) -> store. Safe to re-run."""
 
-    uv run python -m finsight.rag.ingest NVDA AAPL TSLA
-    uv run python -m finsight.rag.ingest --from-samples      # equities in data/samples/*.csv
-
-Idempotent: chunk ids are deterministic (NVDA-10K-FY2026-1A-007) and we upsert, so re-ingesting
-never duplicates. If the stored ids for a filing already match, embedding is skipped entirely
-(embedding is the slow part). ETFs, bond funds and cash are skipped: funds file N-CSR/N-PORT
-reports, not 10-Ks, and their holdings aren't one company's business anyway.
-"""
-
-from __future__ import annotations
-
-import argparse
-import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 
-from finsight.rag.edgar import EdgarClient, FilingNotFoundError, FilingRef, MissingUserAgentError
-from finsight.rag.parse import FULL_DOCUMENT, html_to_text, make_chunks, split_sections
-from finsight.tools.csv_loader import load_portfolio_csv
+from finsight.portfolio.loader import load_portfolio_csv
+from finsight.rag.edgar import download_10k
+from finsight.rag.parse import html_to_text, make_chunks, split_sections
+
+COLLECTION_NAME = "sec_filings"
+BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
-@dataclass
-class IngestResult:
-    ticker: str
-    status: str  # "ingested" | "already_ingested" | "error"
-    chunks: int = 0
-    sections: list[str] = field(default_factory=list)
-    sections_detected: bool = True
-    fiscal_year: int | None = None
-    filing_date: str | None = None
-    message: str = ""
+# =========================
+# Embeddings (local, free)
+# =========================
 
 
-def base_metadata(ref: FilingRef) -> dict:
-    """Chunk metadata (Chroma accepts only str/int/float/bool values: no None)."""
-    return {
-        "ticker": ref.ticker, "company": ref.company, "form": ref.form, "fiscal_year": ref.fiscal_year,
-        "filing_date": ref.filing_date, "report_date": ref.report_date, "accession": ref.accession, "url": ref.url,
-    }
+class LocalEmbedder:
+    """Turns text into 384 numbers so similar meanings end up close together.
+
+    The model (~130 MB) is downloaded once and only loaded on first use, because loading is slow.
+    """
+
+    def __init__(self, model_name: str):
+        self.name = model_name
+        self.model = None
+
+    def load(self):
+        if self.model is None:
+            from sentence_transformers import SentenceTransformer
+
+            self.model = SentenceTransformer(self.name, device="cpu")
+        return self.model
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.load().encode(texts, normalize_embeddings=True).tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        # bge models were trained with this prefix on questions (not on documents).
+        return self.load().encode([BGE_QUERY_PREFIX + text], normalize_embeddings=True)[0].tolist()
 
 
-def ingest_html(html: str | bytes, meta: dict, collection, embedder, *, force: bool = False,
-                batch_size: int = 64) -> IngestResult:
-    """Parse, chunk, embed and upsert one filing. Pure w.r.t. the network (testable offline)."""
-    sections, detected = split_sections(html_to_text(html))
-    chunks = make_chunks(sections, meta)
-    result = IngestResult(meta["ticker"], "ingested", len(chunks), [s.key for s in sections], detected,
-                          meta["fiscal_year"], meta.get("filing_date"))
-    if not detected:
-        result.message = "section headings not detected; indexed as one 'Full document' section"
+# =========================
+# Chroma collection
+# =========================
+
+
+def open_collection(chroma_path: str, embedder_name: str):
+    """Open (or create) the 10-K collection. We pass our own vectors, so Chroma never embeds."""
+    import chromadb  # slow import: only when research or ingest runs
+    from chromadb.config import Settings as ChromaSettings
+
+    Path(chroma_path).mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=chroma_path, settings=ChromaSettings(anonymized_telemetry=False))
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        embedding_function=None,
+        configuration={"hnsw": {"space": "cosine"}},
+        metadata={"embedding_model": embedder_name},
+    )
+    # Vectors from two different models can't be compared, so refuse a mismatch.
+    built_with = (collection.metadata or {}).get("embedding_model")
+    if built_with and built_with != embedder_name:
+        raise ValueError(f"the 10-K index was built with {built_with}, not {embedder_name}")
+    return collection
+
+
+# =========================
+# Ingest
+# =========================
+
+
+def ingest_html(html: str, filing: dict, collection, embedder, force: bool = False) -> dict:
+    """Parse, chunk, embed and store one filing. Returns a small status dict."""
+    sections = split_sections(html_to_text(html))
+    chunks = make_chunks(sections, filing)
+    result = {"ticker": filing["ticker"], "fiscal_year": filing["fiscal_year"],
+              "chunks": len(chunks), "sections": [section["key"] for section in sections]}
     if not chunks:
-        result.status, result.message = "error", "no text extracted"
-        return result
+        return {**result, "status": "error: no text found"}
 
-    new_ids = {c.chunk_id for c in chunks}
-    existing = set(collection.get(where={"accession": meta["accession"]}, include=[])["ids"])
-    if existing == new_ids and not force:
-        result.status = "already_ingested"
-        return result
-    stale = sorted(existing - new_ids)  # e.g. the parser changed and produces fewer chunks now
-    if stale:
-        collection.delete(ids=stale)
+    new_ids = [chunk["id"] for chunk in chunks]
+    old_ids = collection.get(where={"accession": filing["accession"]}, include=[])["ids"]
+    if set(old_ids) == set(new_ids) and not force:
+        return {**result, "status": "already ingested"}  # skip the slow embedding step
 
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        collection.upsert(
-            ids=[c.chunk_id for c in batch],
-            documents=[c.text for c in batch],
-            metadatas=[c.metadata for c in batch],
-            embeddings=embedder.embed_documents([c.text for c in batch]),
+    leftover_ids = [chunk_id for chunk_id in old_ids if chunk_id not in new_ids]
+    if leftover_ids:
+        collection.delete(ids=leftover_ids)
+    for start in range(0, len(chunks), 64):  # in batches, to keep memory small
+        batch = chunks[start:start + 64]
+        texts = [chunk["text"] for chunk in batch]
+        collection.upsert(  # upsert = insert, or overwrite the same id
+            ids=[chunk["id"] for chunk in batch],
+            documents=texts,
+            metadatas=[chunk["metadata"] for chunk in batch],
+            embeddings=embedder.embed_documents(texts),
         )
-    return result
+    return {**result, "status": "ingested"}
 
 
-def ingest_ticker(ticker: str, edgar: EdgarClient, collection, embedder, *, force: bool = False) -> IngestResult:
-    """Download + ingest one ticker. A missing filing or an HTTP/network error skips this ticker
-    (status "error") so the other tickers in the batch still get ingested."""
+def ingest_ticker(ticker: str, user_agent: str, settings, collection, embedder, force: bool = False) -> dict:
+    """Download and ingest one ticker. Errors are returned, so other tickers still run."""
     try:
-        ref = edgar.latest_filing(ticker)
-        path = edgar.download(ref)
-    except FilingNotFoundError as e:
-        return IngestResult(ticker.upper(), "error", message=str(e))
-    except httpx.HTTPError as e:  # message holds the URL and status, never the User-Agent header
-        return IngestResult(ticker.upper(), "error", message=f"SEC request failed: {type(e).__name__}: {e}")
-    return ingest_html(path.read_bytes(), base_metadata(ref), collection, embedder, force=force)
+        html, filing = download_10k(ticker, user_agent, settings.filings_dir)
+    except (LookupError, httpx.HTTPError) as error:
+        return {"ticker": ticker.upper(), "status": f"error: {error}", "chunks": 0, "sections": []}
+    return ingest_html(html, filing, collection, embedder, force)
 
 
-def sample_equity_tickers(samples_dir: str | Path = "data/samples") -> list[str]:
-    """Equity tickers across all sample CSVs (ETFs, bonds, cash, crypto don't file 10-Ks)."""
-    tickers: list[str] = []
-    for csv in sorted(Path(samples_dir).glob("*.csv")):
-        for h in load_portfolio_csv(csv).holdings:
-            if h.asset_type.value == "equity" and h.ticker not in tickers:
-                tickers.append(h.ticker)
+def sample_equity_tickers(samples_dir: str = "data/samples") -> list[str]:
+    """Stocks in the sample CSVs. ETFs, bonds and cash don't file 10-Ks."""
+    tickers = []
+    for csv_path in sorted(Path(samples_dir).glob("*.csv")):
+        for holding in load_portfolio_csv(csv_path).holdings:
+            if holding.asset_type == "equity" and holding.ticker not in tickers:
+                tickers.append(holding.ticker)
     return tickers
-
-
-def main(argv: list[str] | None = None) -> int:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    from finsight.config import get_settings
-    from finsight.rag.embeddings import LocalEmbedder
-    from finsight.rag.store import open_collection
-
-    p = argparse.ArgumentParser(prog="finsight-ingest", description="Ingest latest 10-K filings into Chroma.")
-    p.add_argument("tickers", nargs="*")
-    p.add_argument("--from-samples", action="store_true", help="ingest equities from data/samples/*.csv")
-    p.add_argument("--force", action="store_true", help="re-embed even if already ingested")
-    args = p.parse_args(argv)
-    s = get_settings()
-    tickers = [t.upper() for t in args.tickers] + (sample_equity_tickers() if args.from_samples else [])
-    tickers = list(dict.fromkeys(tickers))
-    if not tickers:
-        p.error("give tickers or --from-samples")
-
-    try:
-        ua = s.sec_user_agent.get_secret_value() if s.sec_user_agent else None
-        edgar = EdgarClient(ua, s.filings_dir)
-    except MissingUserAgentError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-    embedder = LocalEmbedder(s.embedding_model)
-    collection = open_collection(s.chroma_path, embedder.name)
-
-    print(f"Ingesting {len(tickers)} ticker(s): {', '.join(tickers)}  (embeddings: {embedder.name}, local)")
-    failures = 0
-    for t in tickers:
-        r = ingest_ticker(t, edgar, collection, embedder, force=args.force)
-        failures += r.status == "error"
-        secs = ",".join(k for k in r.sections if k != FULL_DOCUMENT) or "-"
-        print(f"  {r.ticker:<6} {r.status:<17} FY{r.fiscal_year or '?':<5} filed {r.filing_date or '?':<10} "
-              f"chunks={r.chunks:<4} sections={secs} {('WARNING: ' + r.message) if r.message else ''}")
-    print(f"Done. Collection now holds {collection.count()} chunks. SEC requests made: {edgar.requests_made}.")
-    return 1 if failures == len(tickers) else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

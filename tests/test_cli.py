@@ -1,26 +1,27 @@
-"""CLI modules import cleanly and the graph CLI prints research sources (offline)."""
+"""CLI: argument checks and report printing (no network, no LLM)."""
 
-import importlib
-from types import SimpleNamespace
-
-import pytest
-
-from finsight.cli_graph import print_summary
+from finsight.cli import main, render_report
 
 
-@pytest.mark.parametrize("module", ["finsight.cli", "finsight.cli_graph", "finsight.research_cli",
-                                    "finsight.rag.ingest"])
-def test_cli_modules_import(module):
-    importlib.import_module(module)  # catches syntax errors that no other test would reach
+def test_ask_needs_a_csv_and_question(capsys):
+    assert main(["ask"]) == 1
+    assert "give a CSV and a question" in capsys.readouterr().err
 
 
-def test_print_summary_lists_research_sources(capsys):
-    report = {"title": "T", "summary": "S", "sections": [], "key_metrics": [], "caveats": [], "disclaimer": "D"}
-    source = {"id": "NVDA-10K-FY2026-1A-000", "title": "NVIDIA 10-K", "section": "Item 1A Risk Factors",
-              "url": "https://sec.example/nvda"}
-    values = {"report": report, "route_log": [], "llm_calls": 3,
-              "research_findings": {"data": {"research:findings": {"sources": [source]}}}}
-    print_summary(SimpleNamespace(values=values, next=()))
-    out = capsys.readouterr().out
-    assert "\nResearch sources:\n" in out
-    assert "  [NVDA-10K-FY2026-1A-000] NVIDIA 10-K | Item 1A Risk Factors\n      https://sec.example/nvda" in out
+def test_resume_needs_a_thread(capsys):
+    assert main(["ask", "--resume"]) == 1
+    assert "need --thread" in capsys.readouterr().err
+
+
+def test_render_report_shows_metrics_sources_and_disclaimer():
+    report = {
+        "title": "Risk",
+        "summary": "Volatility is 44.43%.",
+        "sections": [{"heading": "Volatility", "body": "High."}],
+        "key_metrics": [{"name": "Volatility", "value": 44.43, "unit": "%", "source": "get_risk_metrics"}],
+        "caveats": ["Prices only."],
+    }
+    text = render_report(report)
+    assert "Volatility: 44.43 %   [source: get_risk_metrics]" in text
+    assert "## Volatility" in text
+    assert "not financial advice" in text

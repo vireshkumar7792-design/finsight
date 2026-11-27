@@ -1,327 +1,200 @@
-"""Multi-agent graph, fully offline with scripted fake models.
+"""The whole graph, offline: scripted fake models, fake market data, real checkpoints."""
 
-Fake portfolio (conftest): AAA 48% (Technology), BBB 36% (ETF), CASH 16%.
-"""
-
-import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from tests.fakes import FakeLLM, ScriptExhausted, ai_tools, tool_call
-from finsight.agents.report import enforce_traceability
-from finsight.agents.research_tools import ResearchDeps
-from finsight.agents.supervisor import RouteDecision, make_supervisor_node, plan_from_decision
-from finsight.graph import build_graph, is_stale, open_checkpointer, resume_thread, run_question, thread_config
-from finsight.schemas.report import KeyMetric, Report
-from finsight.state import MAX_ITERATIONS
+from finsight.agents.supervisor import keyword_plan, supervisor_node
+from finsight.graph import build_graph, open_checkpointer, resume_thread, run_question, thread_config
+from finsight.state import RunContext
+from finsight.tools.research_tools import ResearchSources
+from tests.fakes import FakeLLM, tool_calls_message
 
-SECTOR_SRC = "portfolio:get_allocation(by=sector)"
+SECTOR_SOURCE = "get_allocation(by=sector)"
 
 
-def a_report(metrics=(("Technology weight", 48.0, "%", SECTOR_SRC),), summary="Tech is 48%.") -> dict:
+# =========================
+# Helpers
+# =========================
+
+
+def make_run_context(portfolio_context, router=(), agent=(), report=()) -> RunContext:
+    return RunContext(
+        portfolio=portfolio_context,
+        router_llm=FakeLLM(structured=list(router)),
+        agent_llm=FakeLLM(script=list(agent)),
+        report_llm=FakeLLM(structured=list(report)),
+        settings=None,  # only used to open research sources, which tests pass in directly
+        research=ResearchSources(collection=None, embedder=None, tavily_api_key=None, tavily_cache_dir=""),
+    )
+
+
+def plan(*agents, reason="test plan"):
+    return {"agents": list(agents), "reason": reason}
+
+
+def report(metrics=(("Technology weight", 48.0, "%", SECTOR_SOURCE),)):
     return {
         "title": "Sector exposure",
-        "summary": summary,
+        "summary": "Technology is 48% as of 2024-01-04.",
         "sections": [{"heading": "Allocation", "body": "Mostly technology."}],
-        "key_metrics": [{"name": n, "value": v, "unit": u, "source_tool": s} for n, v, u, s in metrics],
+        "key_metrics": [{"name": n, "value": v, "unit": u, "source": s} for n, v, u, s in metrics],
         "caveats": [],
-        "disclaimer": "whatever the model wrote",
     }
 
 
-def route(next_, then=(), reason="test route"):
-    return RouteDecision(next=next_, then=list(then), reason=reason)
-
-
-def make(test_settings, router=(), agent=(), report=(), report_script=(), **kw):
-    r, a, p = FakeLLM(structured=list(router)), FakeLLM(script=list(agent)), FakeLLM(
-        structured=list(report), script=list(report_script))
-    # Default: research has no sources configured, so it makes no LLM call (see test_research.py).
-    deps = kw.pop("research_deps", ResearchDeps(retriever=None, web=None))
-    g = build_graph(router=r, agent_model=a, report_model=p, settings=test_settings,
-                    checkpointer=kw.pop("checkpointer", InMemorySaver()), research_deps=deps, **kw)
-    return g, r, a, p
-
-
-def path(values):
-    return [e["to"] for e in values["route_log"]]
-
-
-# ---- routing --------------------------------------------------------------------------------
-
-
-def test_sector_question_routes_portfolio_then_report(fake_ctx, test_settings):
-    g, r, a, p = make(
-        test_settings,
-        router=[route("portfolio", reason="allocation question")],
-        agent=[ai_tools(tool_call("get_allocation", {"by": "sector"})), AIMessage(content="Technology is 48%.")],
-        report=[a_report()],
-    )
-    v = run_question(g, fake_ctx, "What's my sector exposure?", "t1", "fake.csv").values
-
-    assert path(v) == ["portfolio", "report"]
-    assert v["route_log"][0] == {"to": "portfolio", "reason": "allocation question", "by": "llm"}
-    assert v["completed_agents"] == ["portfolio"]
-    f = v["portfolio_findings"]
-    assert f["summary"] == "Technology is 48%."
-    assert f["data"][SECTOR_SRC]["allocation"][0] == {"group": "Technology", "weight_pct": 48.0, "tickers": ["AAA"]}
-    assert v["report_mode"] == "structured"
-    assert v["report"]["key_metrics"][0]["value"] == 48.0
-    assert v["llm_calls"] == 4  # router 1 + portfolio 2 + report 1
-    assert r.n_calls + a.n_calls + p.n_calls == 4
-    assert [type(m) for m in v["messages"]] == [HumanMessage, AIMessage]  # conversation memory
-
-
-def test_two_specialists_run_in_planned_order(fake_ctx, test_settings):
-    g, *_ = make(
-        test_settings,
-        router=[route("portfolio", ["risk"], "diversification needs both")],
-        agent=[
-            ai_tools(tool_call("get_allocation", {"by": "asset_type"})), AIMessage(content="Equity 48%."),
-            ai_tools(tool_call("get_risk_metrics"), tool_call("get_correlations")), AIMessage(content="HHI 0.386."),
-        ],
-        report=[a_report(metrics=[("HHI", 0.386, "ratio", "risk:get_risk_metrics")])],
-    )
-    v = run_question(g, fake_ctx, "Is my portfolio diversified?", "t2", "fake.csv").values
-    assert path(v) == ["portfolio", "risk", "report"]
-    assert v["route_log"][1]["by"] == "plan"  # second hop is deterministic, no LLM
-    assert set(v["risk_findings"]["data"]) == {"risk:get_risk_metrics", "risk:get_correlations"}
-    assert v["llm_calls"] == 6  # 1 + 2 + 2 + 1
-    assert v["report"]["key_metrics"][0]["name"] == "HHI"
-
-
-def test_research_without_sources_records_gap_without_llm(fake_ctx, test_settings):
-    g, _, agent, _ = make(test_settings, router=[route("research")], report=[a_report(metrics=())])
-    v = run_question(g, fake_ctx, "Research NVDA", "t3", "fake.csv").values
-    assert path(v) == ["research", "report"]
-    rf = v["research_findings"]["data"]["research:findings"]
-    assert rf["tickers"] == ["NVDA"] and rf["insights"] == []
-    assert any("no research sources configured" in g for g in rf["gaps"])
-    assert agent.n_calls == 0
-    assert v["llm_calls"] == 2
-
-
-# ---- fallbacks ------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "bad_router_output",
-    [{"next": "banana", "then": [], "reason": "x"}, RuntimeError("429 Too Many Requests"), {"oops": 1}],
-    ids=["invalid-choice", "exception", "wrong-shape"],
-)
-def test_router_failure_falls_back_to_report(fake_ctx, test_settings, bad_router_output):
-    g, *_ = make(test_settings, router=[bad_router_output], report=[a_report(metrics=())])
-    v = run_question(g, fake_ctx, "What's my sector exposure?", "t4", "fake.csv").values
-    assert path(v) == ["report"]
-    assert v["plan"]["source"] == "fallback"
-    assert any("router failed" in e for e in v["errors"])
-    assert v["report"] is not None
-
-
-def test_finish_is_coerced_to_report(fake_ctx, test_settings):
-    g, *_ = make(test_settings, router=[route("finish", ["risk"])], report=[a_report(metrics=())])
-    v = run_question(g, fake_ctx, "hi", "t5", "fake.csv").values
-    assert path(v) == ["report"]
-
-
-def test_plan_skips_completed_and_duplicates():
-    d = route("risk", ["risk", "portfolio", "research"])
-    assert plan_from_decision(d, completed=["portfolio"])["agents"] == ["risk", "research"]
-    assert plan_from_decision(route("report", ["risk"]), [])["agents"] == []
-
-
-def test_max_iterations_forces_report():
-    node = make_supervisor_node(FakeLLM())  # would raise if called
-    out = node({"question": "q", "iteration": MAX_ITERATIONS, "plan": {"agents": ["risk"], "reason": "", "source": "llm"}})
-    assert out["next_agent"] == "report" and out["route_log"][0]["by"] == "guard"
-    assert "max iterations" in out["errors"][0]
-
-
-def test_specialist_failure_is_recorded_and_report_still_runs(fake_ctx, test_settings):
-    g, *_ = make(test_settings, router=[route("risk")], agent=[RuntimeError("provider down")],
-                 report=[a_report(metrics=())])
-    v = run_question(g, fake_ctx, "How risky?", "t6", "fake.csv").values
-    assert path(v) == ["risk", "report"]
-    assert v["risk_findings"] is None
-    assert any("risk agent failed" in e for e in v["errors"])
-    assert v["report_mode"] == "structured"
-
-
-def test_specialist_without_tool_calls_gets_default_data(fake_ctx, test_settings):
-    g, *_ = make(test_settings, router=[route("risk")], agent=[AIMessage(content="Looks risky.")],
-                 report=[a_report(metrics=())])
-    v = run_question(g, fake_ctx, "How risky?", "t7", "fake.csv").values
-    f = v["risk_findings"]
-    assert set(f["data"]) == {"risk:get_risk_metrics", "risk:get_correlations"}
-    assert "default tool data attached" in f["summary"]
-
-
-def test_report_falls_back_to_plain_text_then_deterministic(fake_ctx, test_settings):
-    bad = {"title": "missing fields"}
-    g, *_ = make(test_settings, router=[route("research")], report=[bad, RuntimeError("400")],
-                 report_script=[AIMessage(content="Plain answer.")])
-    v = run_question(g, fake_ctx, "Research NVDA", "t8", "fake.csv").values
-    assert v["report_mode"] == "plain_text_fallback"
-    assert v["report"]["summary"] == "Plain answer."
-    assert v["llm_calls"] == 1 + 3  # router + (2 structured attempts + 1 plain)
-
-    g, *_ = make(test_settings, router=[route("research")], report=[bad, bad], report_script=[RuntimeError("down")])
-    v = run_question(g, fake_ctx, "Research NVDA", "t9", "fake.csv").values
-    assert v["report_mode"] == "deterministic_fallback"
-    assert v["report"]["sections"][0]["heading"] == "Research findings"
-
-
-def test_traceability_drops_untraceable_metrics():
-    findings = {"portfolio": {"data": {SECTOR_SRC: {"allocation": [{"weight_pct": 48.0}]}}}}
-    r = Report.model_validate(a_report(metrics=[
-        ("Tech", 48.0, "%", SECTOR_SRC),          # kept
-        ("Made up", 99.9, "%", SECTOR_SRC),       # value not in source
-        ("Wrong source", 48.0, "%", "risk:x"),    # source doesn't exist
-    ]))
-    out = enforce_traceability(r, findings)
-    assert [m.name for m in out.key_metrics] == ["Tech"]
-    assert "Removed 2 metric(s)" in out.caveats[-1]
-    assert out.disclaimer.endswith("Not financial advice.")
-    assert isinstance(out.key_metrics[0], KeyMetric)
-
-
-def test_fake_llm_detects_extra_calls():
-    with pytest.raises(ScriptExhausted):
-        FakeLLM().invoke("hello")
-
-
-# ---- checkpoints, resume, follow-ups ---------------------------------------------------------
-
-
-def test_state_persists_in_sqlite_and_reloads(fake_ctx, test_settings, tmp_path):
-    db = tmp_path / "ckpt.sqlite"
-    with open_checkpointer(db) as saver:
-        g, *_ = make(test_settings, router=[route("research")], report=[a_report(metrics=())], checkpointer=saver)
-        run_question(g, fake_ctx, "Research NVDA", "persist", "fake.csv")
-
-    # A brand-new connection + graph (like a new process) sees the saved thread.
-    with open_checkpointer(db) as saver:
-        g2, *_ = make(test_settings, checkpointer=saver)
-        snap = g2.get_state(thread_config("persist"))
-        assert snap.values["question"] == "Research NVDA"
-        assert snap.values["report"]["title"] == "Sector exposure"
-        assert snap.next == ()  # finished
-        assert len(list(g2.get_state_history(thread_config("persist")))) >= 4
-        assert g2.get_state(thread_config("unknown-thread")).values == {}
-
-
-def test_interrupted_run_resumes_from_checkpoint(fake_ctx, test_settings, tmp_path):
-    db = tmp_path / "ckpt.sqlite"
-    with open_checkpointer(db) as saver:  # run 1: stops before the report node
-        g, *_ = make(test_settings, router=[route("research")], checkpointer=saver, interrupt_before=["report"])
-        snap = run_question(g, fake_ctx, "Research NVDA", "resume-me", "fake.csv")
-        assert snap.next == ("report",)
-        assert snap.values["research_findings"]["agent"] == "research"
-        assert snap.values.get("report") is None
-
-    with open_checkpointer(db) as saver:  # run 2 (new process): continue, no router call needed
-        g2, router2, _, _ = make(test_settings, report=[a_report(metrics=())], checkpointer=saver)
-        snap = resume_thread(g2, fake_ctx, "resume-me")
-        assert snap.next == ()
-        assert snap.values["report"] is not None
-        assert router2.n_calls == 0  # the plan came from the checkpoint
-        assert path(snap.values) == ["research", "report"]
-
-
-def test_follow_up_question_sees_prior_conversation(fake_ctx, test_settings):
-    g, router, *_ = make(
-        test_settings,
-        router=[route("research"), route("research")],
-        report=[a_report(metrics=(), summary="NVDA research is a stub."), a_report(metrics=(), summary="Still a stub.")],
-    )
-    run_question(g, fake_ctx, "Research NVDA", "conv", "fake.csv")
-    v = run_question(g, fake_ctx, "And AAPL?", "conv", "fake.csv").values
-
-    assert [m.content for m in v["messages"] if isinstance(m, HumanMessage)] == ["Research NVDA", "And AAPL?"]
-    assert len(v["messages"]) == 4
-    assert v["question"] == "And AAPL?"
-    assert v["completed_agents"] == ["research"]  # per-question fields were reset
-    assert v["llm_calls"] == 2  # counter reset too
-    second_router_prompt = router._structured_calls[1][-1].content
-    assert "NVDA research is a stub." in second_router_prompt  # memory reached the router
-
-
-# ---- real LLM (free Groq router), skipped by default ------------------------------------------
-
-
-@pytest.mark.llm
-@pytest.mark.parametrize(
-    "question, expected",
-    [("Research NVDA", {"research"}), ("What's my sector exposure?", {"portfolio"}),
-     ("Is my portfolio diversified?", {"portfolio", "risk"})],
-)
-def test_real_router_plans_sensibly(question, expected):
-    from finsight.agents.supervisor import route_with_llm
-    from finsight.config import get_llm, get_settings
-
-    if get_settings().groq_api_key is None:
-        pytest.skip("GROQ_API_KEY not set")
-    d = route_with_llm(get_llm("router"), {"question": question, "messages": []})
-    assert {d.next, *d.then} == expected
-
-
-def test_specialist_transcript_is_not_checkpointed(fake_ctx, test_settings, tmp_path):
-    import sqlite3
-
-    db = tmp_path / "ckpt.sqlite"
-    with open_checkpointer(db) as saver:
-        g, *_ = make(test_settings, router=[route("portfolio")], checkpointer=saver,
-                     agent=[ai_tools(tool_call("get_allocation", {"by": "sector"})), AIMessage(content="ok")],
-                     report=[a_report()])
-        run_question(g, fake_ctx, "sector?", "ns", "fake.csv")
-    namespaces = {r[0] for r in sqlite3.connect(db).execute("select distinct checkpoint_ns from checkpoints")}
-    assert namespaces == {""}  # only the parent graph; no 'portfolio:...' subgraph checkpoints
-
-
-# ---- stale data on resume ----------------------------------------------------------------------
-
-
-def _ctx_on_later_day(fake_portfolio, test_settings):
-    """Same portfolio, but market data ending a month later (like resuming on another day)."""
-    import pandas as pd
-
-    from finsight.context import PortfolioContext
-    from tests.conftest import FAKE_CLOSES, FAKE_SECTORS
-
-    def history(tickers, period):
-        idx = pd.date_range("2024-02-01", periods=4, name="Date")
-        return pd.DataFrame({t: FAKE_CLOSES[t] for t in tickers}, index=idx)
-
-    return PortfolioContext.load(fake_portfolio, test_settings, fetch_history=history,
-                                 fetch_sectors=lambda ts: {t: FAKE_SECTORS[t] for t in ts})
-
-
-def test_stale_resume_restarts_question_on_new_data(fake_ctx, fake_portfolio, test_settings, tmp_path):
-    db = tmp_path / "ckpt.sqlite"
-    with open_checkpointer(db) as saver:
-        g, *_ = make(test_settings, router=[route("research")], checkpointer=saver, interrupt_before=["report"])
-        snap = run_question(g, fake_ctx, "Research NVDA", "stale", "fake.csv")
-        assert snap.values["data_as_of"] == "2024-01-04"
-
-    later = _ctx_on_later_day(fake_portfolio, test_settings)
-    assert later.as_of == "2024-02-04"
-    with open_checkpointer(db) as saver:
-        g2, router2, _, _ = make(test_settings, router=[route("research")], report=[a_report(metrics=())],
-                                 checkpointer=saver)
-        assert is_stale(g2, later, "stale") and not is_stale(g2, fake_ctx, "stale")
-        snap = resume_thread(g2, later, "stale")
-    v = snap.values
-    assert snap.next == () and v["report"] is not None
-    assert v["data_as_of"] == "2024-02-04"
-    assert router2.n_calls == 1  # question re-planned from scratch on the new data
-    assert path(v) == ["research", "report"]  # fresh per-question log, not the old one + new
-
-
-def test_same_day_resume_is_unaffected(fake_ctx, test_settings, tmp_path):
-    db = tmp_path / "ckpt.sqlite"
-    with open_checkpointer(db) as saver:
-        g, *_ = make(test_settings, router=[route("research")], checkpointer=saver, interrupt_before=["report"])
-        run_question(g, fake_ctx, "Research NVDA", "same", "fake.csv")
-        g2, router2, _, _ = make(test_settings, report=[a_report(metrics=())], checkpointer=saver)
-        snap = resume_thread(g2, fake_ctx, "same")  # same day: continues, no re-plan
-    assert snap.next == () and router2.n_calls == 0
+def sector_agent_script():
+    return [tool_calls_message(("get_allocation", {"by": "sector"})), AIMessage(content="Technology is 48%.")]
+
+
+def route(state):
+    return [step["to"] for step in state["route_log"]]
+
+
+def total_calls(run_context):
+    return run_context.router_llm.total_calls + run_context.agent_llm.total_calls + run_context.report_llm.total_calls
+
+
+# =========================
+# Routing
+# =========================
+
+
+def test_sector_question_runs_portfolio_then_report(portfolio_context):
+    run_context = make_run_context(portfolio_context, [plan("portfolio")], sector_agent_script(), [report()])
+    state = run_question(build_graph(InMemorySaver()), run_context, "What's my sector exposure?", "t1")
+
+    assert route(state) == ["portfolio", "report"]
+    finding = state["findings"]["portfolio"]
+    assert finding["summary"] == "Technology is 48%."
+    assert finding["data"][SECTOR_SOURCE]["allocation"][0]["weight_pct"] == 48.0
+    assert state["report"]["key_metrics"][0]["value"] == 48.0
+    assert state["tool_calls"] == [{"agent": "portfolio", "name": "get_allocation", "args": {"by": "sector"}}]
+    assert total_calls(run_context) == 4  # router 1 + portfolio agent 2 + report 1
+    assert [message.type for message in state["messages"]] == ["human", "ai"]
+
+
+def test_two_agents_run_in_planned_order(portfolio_context):
+    agent_script = sector_agent_script() + [
+        tool_calls_message(("get_risk_metrics", {}), ("get_correlations", {})),
+        AIMessage(content="HHI is 0.386."),
+    ]
+    metrics = [("HHI", 0.386, "ratio", "get_risk_metrics")]
+    run_context = make_run_context(portfolio_context, [plan("portfolio", "risk")], agent_script, [report(metrics)])
+    state = run_question(build_graph(InMemorySaver()), run_context, "Is my portfolio diversified?", "t2")
+
+    assert route(state) == ["portfolio", "risk", "report"]
+    assert [step["by"] for step in state["route_log"]] == ["llm", "plan", "plan"]  # only one router call
+    assert set(state["findings"]["risk"]["data"]) == {"get_risk_metrics", "get_correlations"}
+    assert state["report"]["key_metrics"][0]["name"] == "HHI"
+    assert total_calls(run_context) == 6
+
+
+def test_router_retries_once_then_succeeds(portfolio_context):
+    bad_plan = {"agents": ["banana"], "reason": "x"}
+    run_context = make_run_context(portfolio_context, [bad_plan, plan("portfolio")], sector_agent_script(), [report()])
+    state = run_question(build_graph(InMemorySaver()), run_context, "Sector exposure?", "t3")
+    assert state["route_log"][0]["by"] == "llm"
+    assert route(state) == ["portfolio", "report"]
+
+
+def test_router_failing_twice_uses_keyword_fallback(portfolio_context):
+    failures = [RuntimeError("429 Too Many Requests"), RuntimeError("429 again")]
+    run_context = make_run_context(portfolio_context, failures, sector_agent_script(), [report()])
+    state = run_question(build_graph(InMemorySaver()), run_context, "What's my sector exposure?", "t4")
+    assert state["route_log"][0]["by"] == "fallback"
+    assert route(state) == ["portfolio", "report"]
+    assert any("keyword routing" in error for error in state["errors"])
+
+
+def test_keyword_plan():
+    assert keyword_plan("Is my portfolio diversified?") == ["portfolio", "risk"]
+    assert keyword_plan("How risky is it?") == ["risk"]
+    assert keyword_plan("Any news on NVDA?") == ["research"]
+    assert keyword_plan("hello") == ["portfolio"]
+
+
+def test_supervisor_stops_after_too_many_visits():
+    state = {"supervisor_visits": 6, "plan": ["risk"], "plan_reason": "", "completed_agents": [],
+             "route_log": [], "errors": []}
+    update = supervisor_node(state, runtime=None)  # no LLM is needed after the first visit
+    assert update["next_agent"] == "report"
+
+
+# =========================
+# Fallbacks and grounding
+# =========================
+
+
+def test_everything_fails_but_the_run_still_finishes(portfolio_context):
+    agent_failures = [RuntimeError("down"), RuntimeError("still down")]
+    report_failures = [RuntimeError("down"), RuntimeError("still down")]
+    run_context = make_run_context(portfolio_context, [plan("portfolio")], agent_failures, report_failures)
+    state = run_question(build_graph(InMemorySaver()), run_context, "Sector exposure?", "t5")
+
+    # The agent's default tools ran without the LLM, so real numbers are still there.
+    assert set(state["findings"]["portfolio"]["data"]) == {"get_portfolio_summary", SECTOR_SOURCE}
+    assert state["report"]["title"] == "FinSight report (automatic summary)"
+    assert len(state["errors"]) == 3  # two agent attempts + the report
+
+
+def test_agent_that_calls_no_tools_gets_default_data(portfolio_context):
+    lazy_answer = [AIMessage(content="I think tech is big.")]
+    run_context = make_run_context(portfolio_context, [plan("risk")], lazy_answer, [report(metrics=())])
+    state = run_question(build_graph(InMemorySaver()), run_context, "How risky?", "t6")
+    assert set(state["findings"]["risk"]["data"]) == {"get_risk_metrics", "get_correlations"}
+
+
+def test_untraceable_metrics_are_dropped(portfolio_context):
+    metrics = [
+        ("Technology weight", 48.0, "%", SECTOR_SOURCE),  # real
+        ("Made-up weight", 99.9, "%", SECTOR_SOURCE),  # number not in the data
+        ("Wrong source", 48.0, "%", "get_nothing"),  # source doesn't exist
+    ]
+    run_context = make_run_context(portfolio_context, [plan("portfolio")], sector_agent_script(), [report(metrics)])
+    state = run_question(build_graph(InMemorySaver()), run_context, "Sector exposure?", "t7")
+    assert [metric["name"] for metric in state["report"]["key_metrics"]] == ["Technology weight"]
+    assert "Made-up weight, Wrong source" in state["report"]["caveats"][-1]
+
+
+# =========================
+# Memory and checkpoints
+# =========================
+
+
+def test_follow_up_question_keeps_the_conversation(portfolio_context):
+    graph = build_graph(InMemorySaver())
+    first = make_run_context(portfolio_context, [plan("portfolio")], sector_agent_script(), [report()])
+    run_question(graph, first, "What's my sector exposure?", "chat")
+
+    second = make_run_context(portfolio_context, [plan()], [], [report(metrics=())])
+    state = run_question(graph, second, "Thanks, can you repeat that?", "chat")
+
+    assert len(state["messages"]) == 4  # question, answer, question, answer
+    assert state["findings"] == {}  # per-question data was reset
+    assert route(state) == ["report"]
+
+
+def test_resume_after_a_stop(portfolio_context, tmp_path):
+    database = str(tmp_path / "checkpoints.sqlite")
+    stopped_graph = build_graph(open_checkpointer(database), interrupt_before=["report"])
+    run_context = make_run_context(portfolio_context, [plan("portfolio")], sector_agent_script(), [report()])
+    run_question(stopped_graph, run_context, "Sector exposure?", "t8")
+    assert stopped_graph.get_state(thread_config("t8")).next == ("report",)
+
+    # A fresh graph on the same database, like restarting the program.
+    new_graph = build_graph(open_checkpointer(database))
+    state = resume_thread(new_graph, run_context, "t8")
+    assert state["report"]["title"] == "Sector exposure"
+    assert run_context.router_llm.total_calls == 1  # the plan was not made again
+
+
+def test_resume_with_newer_market_data_starts_over(portfolio_context):
+    checkpointer = InMemorySaver()
+    stopped_graph = build_graph(checkpointer, interrupt_before=["report"])
+    run_context = make_run_context(portfolio_context, [plan("portfolio")] * 2, sector_agent_script() * 2, [report()])
+    run_question(stopped_graph, run_context, "Sector exposure?", "t9")
+
+    portfolio_context.as_of = "2099-01-01"  # pretend it's a new day with new prices
+    state = resume_thread(build_graph(checkpointer), run_context, "t9")
+    assert state["data_as_of"] == "2099-01-01"
+    assert run_context.router_llm.total_calls == 2  # the question was asked again from the start

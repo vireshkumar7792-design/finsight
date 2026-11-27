@@ -1,121 +1,102 @@
-"""Supervisor: decides which specialists a question needs, via structured output on the router LLM.
+"""Supervisor: ONE LLM call per question makes a plan; after that, code just follows the plan."""
 
-Plan once, execute deterministically:
-  1st visit for a question -> ONE LLM call returns RouteDecision(next, then, reason): the plan.
-  later visits             -> no LLM call: go to the next planned agent not yet completed,
-                              or to "report" when the plan is done.
-The routing decision is still LLM-driven (the LLM chose the plan); code only walks it. A
-classic supervisor re-asks the LLM after every specialist, which costs 1-2 extra calls per
-question on a free tier with little benefit for questions this direct.
-
-Guard rails (free models fail more often):
-  - router exception / unparseable output -> fallback: straight to report with what we have
-  - "finish" or "report" -> report (every question ends with a report)
-  - an agent already completed is never re-planned
-  - more than MAX_ITERATIONS supervisor visits -> report
-"""
-
-from __future__ import annotations
-
-from typing import Any, Literal
-
-from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, ConfigDict, Field
+from langgraph.runtime import Runtime
 
-from finsight.agents.structured import structured_invoke
-from finsight.state import MAX_ITERATIONS, FinSightState, prior_conversation
+from finsight.agents.common import ask_structured, short_error
+from finsight.schemas import RoutePlan
+from finsight.state import FinSightState, RunContext, earlier_conversation
 
-SPECIALISTS = ("portfolio", "risk", "research")
-ROUTES = (*SPECIALISTS, "report")
+MAX_SUPERVISOR_VISITS = 6  # safety net: never loop forever
 
+# =========================
+# Prompt
+# =========================
 
-class RouteDecision(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    next: Literal["portfolio", "risk", "research", "report", "finish"] = Field(
-        description="First specialist to run, or 'report' if no specialist is needed"
-    )
-    then: list[Literal["portfolio", "risk", "research"]] = Field(
-        description="Other specialists also needed after `next`, in order. Empty list if none."
-    )
-    reason: str = Field(description="One short sentence explaining the choice")
+PROMPT = """You route questions about a user's investment portfolio to specialist analysts.
 
+Analysts:
+- portfolio: holdings, total value, position sizes, gains and losses (performance),
+  allocation by sector or asset type, details of one holding.
+- risk: volatility, beta, Sharpe ratio, Value at Risk, drawdown, concentration,
+  correlations, how risky or how diversified the portfolio is.
+- research: news, business outlook, competition or 10-K filings for a specific company.
 
-ROUTER_PROMPT = """You route questions about a user's investment portfolio to specialist analysts.
+Pick the smallest list of analysts that fully answers the question, in a sensible order.
+Diversification needs both portfolio and risk. Use an empty list only when no analyst is
+needed (a greeting, or the answer is already in the earlier conversation)."""
 
-Specialists:
-- portfolio: holdings, total value, position sizes/weights, gains and losses (P&L, performance), \
-allocation by sector or asset type, details of one holding.
-- risk: volatility, beta, Sharpe ratio, Value at Risk, drawdown, concentration, correlations, \
-how risky or how diversified the portfolio is.
-- research: news, fundamentals, business outlook or filings for a specific company or market.
-
-Choose the minimum set of specialists that fully covers the question:
-- set `next` to the first one and list any others in `then` (no duplicates);
-- diversification needs both portfolio (allocation) and risk (correlation, concentration);
-- use `next: "report"` with empty `then` only if no specialist is needed (greetings, or the \
-answer is already in the earlier conversation).
-Return only the structured decision."""
+# =========================
+# Node
+# =========================
 
 
-def plan_from_decision(d: RouteDecision, completed: list[str]) -> dict[str, Any]:
-    """Turn a RouteDecision into an ordered list of agents still to run."""
-    if d.next in ("report", "finish"):
-        agents: list[str] = []
+def supervisor_node(state: FinSightState, runtime: Runtime[RunContext]) -> dict:
+    visits = state["supervisor_visits"] + 1
+    update = {"supervisor_visits": visits}
+
+    if visits == 1:
+        # First visit for this question: the one LLM call.
+        plan, reason, decided_by, errors = make_plan(state, runtime.context.router_llm)
+        update["plan"] = plan
+        update["plan_reason"] = reason
+        update["errors"] = errors
     else:
-        agents = list(dict.fromkeys([d.next, *d.then]))  # dedupe, keep order
-    agents = [a for a in agents if a not in completed]
-    return {"agents": agents, "reason": d.reason, "source": "llm"}
+        plan = state["plan"]
+        reason = "next agent in the plan"
+        decided_by = "plan"
+
+    remaining = [agent for agent in plan if agent not in state["completed_agents"]]
+    if visits > MAX_SUPERVISOR_VISITS:
+        next_agent = "report"
+        reason = f"safety stop after {MAX_SUPERVISOR_VISITS} steps"
+    elif remaining:
+        next_agent = remaining[0]
+    else:
+        next_agent = "report"
+        if decided_by == "plan":
+            reason = "all planned agents are done"
+
+    update["next_agent"] = next_agent
+    update["route_log"] = state["route_log"] + [{"to": next_agent, "by": decided_by, "reason": reason}]
+    return update
 
 
-def route_with_llm(llm: BaseChatModel, state: FinSightState) -> RouteDecision:
+# =========================
+# Helpers
+# =========================
+
+
+def make_plan(state: FinSightState, router_llm) -> tuple[list[str], str, str, list[str]]:
+    """Returns (plan, reason, decided_by, errors). Falls back to keywords if the LLM fails."""
     messages = [
-        SystemMessage(content=ROUTER_PROMPT),
-        HumanMessage(
-            content=f"Earlier conversation:\n{prior_conversation(state)}\n\nQuestion: {state['question']}"
-        ),
+        SystemMessage(content=PROMPT),
+        HumanMessage(content=f"Earlier conversation:\n{earlier_conversation(state)}\n\nQuestion: {state['question']}"),
     ]
-    return structured_invoke(llm, RouteDecision, messages)
+    try:
+        route_plan = ask_structured(router_llm, RoutePlan, messages)
+    except Exception as error:
+        plan = keyword_plan(state["question"])
+        errors = state["errors"] + [f"supervisor LLM failed ({short_error(error)}); used keyword routing"]
+        return plan, "keyword fallback", "fallback", errors
+    plan = list(dict.fromkeys(route_plan.agents))  # drop duplicates, keep order
+    return plan, route_plan.reason, "llm", state["errors"]
 
 
-def make_supervisor_node(llm: BaseChatModel):
-    def supervisor(state: FinSightState) -> dict[str, Any]:
-        iteration = (state.get("iteration") or 0) + 1
-        completed = list(state.get("completed_agents") or [])
-        update: dict[str, Any] = {"iteration": iteration}
-
-        if iteration > MAX_ITERATIONS:
-            reason = f"max iterations ({MAX_ITERATIONS}) reached; reporting with what we have"
-            return {**update, "next_agent": "report", "errors": [reason],
-                    "route_log": [{"to": "report", "reason": reason, "by": "guard"}]}
-
-        plan = state.get("plan")
-        by = "plan"
-        if plan is None:  # first visit for this question: the one LLM routing call
-            update["llm_calls"] = 1
-            by = "llm"
-            try:
-                plan = plan_from_decision(route_with_llm(llm, state), completed)
-            except Exception as e:  # StructuredOutputError, provider errors, anything
-                msg = f"router failed ({type(e).__name__}: {str(e)[:150]}); fallback to report"
-                plan = {"agents": [], "reason": msg, "source": "fallback"}
-                update["errors"] = [msg]
-                by = "fallback"
-            update["plan"] = plan
-
-        pending = [a for a in plan["agents"] if a not in completed and a in SPECIALISTS]
-        if pending:
-            nxt = pending[0]
-            reason = plan["reason"] if by != "plan" else f"next in plan (remaining: {', '.join(pending)})"
-        else:
-            nxt = "report"
-            reason = plan["reason"] if (by != "plan" and not plan["agents"]) else "all planned specialists done"
-        return {**update, "next_agent": nxt, "route_log": [{"to": nxt, "reason": reason, "by": by}]}
-
-    return supervisor
+PORTFOLIO_WORDS = ["sector", "allocation", "holding", "position", "value", "worth", "gain", "loss",
+                   "p&l", "perform", "diversif", "weight", "exposure"]
+RISK_WORDS = ["risk", "volatil", "beta", "sharpe", "drawdown", "diversif", "correlat", "concentrat"]
+RESEARCH_WORDS = ["news", "research", "10-k", "filing", "competition", "outlook", "business"]
 
 
-def route_after_supervisor(state: FinSightState) -> str:
-    """Conditional edge: where the graph goes after the supervisor. Anything unknown -> report."""
-    nxt = state.get("next_agent")
-    return nxt if nxt in ROUTES else "report"
+def keyword_plan(question: str) -> list[str]:
+    """Simple routing by keywords, used only when the router LLM fails twice."""
+    text = question.lower()
+    plan = []
+    if any(word in text for word in PORTFOLIO_WORDS):
+        plan.append("portfolio")
+    if any(word in text for word in RISK_WORDS):
+        plan.append("risk")
+    if any(word in text for word in RESEARCH_WORDS):
+        plan.append("research")
+    return plan or ["portfolio"]

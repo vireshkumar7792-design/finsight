@@ -1,135 +1,124 @@
-"""LangGraph StateGraph assembly: supervisor routing, specialists, report, SqliteSaver checkpoints.
+"""The FinSight graph: supervisor -> specialist agents -> report, with SQLite checkpoints.
 
-    START -> supervisor -(conditional)-> portfolio | risk | research | report
-             portfolio / risk / research -> supervisor
+    START -> supervisor -> portfolio | risk | research | report
+             each specialist -> back to supervisor
              report -> END
-
-Persistence: compiled with a checkpointer, LangGraph saves the full state after every node
-("super-step") under the run's thread_id. That gives us:
-  - resume:     graph.invoke(None, config) continues an unfinished run from its last checkpoint
-  - follow-ups: a new question on the same thread_id starts from the saved state, so
-                `messages` (conversation memory) carries over
-  - inspection: graph.get_state(config) / get_state_history(config)
-PortfolioContext is passed per run via `context=` and is NOT checkpointed (see state.py).
 """
 
-from __future__ import annotations
-
 import sqlite3
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
-from langchain_core.language_models import BaseChatModel
-from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
-from finsight.agents.report import make_report_node
-from finsight.agents.research import make_research_node, research_deps_from_settings
-from finsight.agents.specialist import make_portfolio_node, make_risk_node
-from finsight.agents.supervisor import make_supervisor_node, route_after_supervisor
+from finsight.agents.portfolio_agent import portfolio_node
+from finsight.agents.report_agent import report_node
+from finsight.agents.research_agent import research_node
+from finsight.agents.risk_agent import risk_node
+from finsight.agents.supervisor import supervisor_node
 from finsight.config import Settings, get_llm, get_settings
-from finsight.context import PortfolioContext
-from finsight.state import FinSightState, new_question_input
+from finsight.portfolio.context import load_context
+from finsight.state import FinSightState, RunContext, new_question
 
-NODES = ("supervisor", "portfolio", "risk", "research", "report")
+# =========================
+# 1. LLMs + data for one run
+# =========================
 
 
-def build_graph(
-    *,
-    router: BaseChatModel | None = None,
-    agent_model: BaseChatModel | None = None,
-    report_model: BaseChatModel | None = None,
-    checkpointer: BaseCheckpointSaver | None = None,
-    settings: Settings | None = None,
-    interrupt_before: list[str] | None = None,
-    research_deps=None,
-):
-    """Compile the FinSight graph. Pass fake models in tests; defaults come from get_llm(role)."""
-    s = settings or get_settings()
-    router = router or get_llm("router", s)
-    agent_model = agent_model or get_llm("agent", s)
-    report_model = report_model or get_llm("report", s)
-
-    g = StateGraph(FinSightState, context_schema=PortfolioContext)
-    g.add_node("supervisor", make_supervisor_node(router))
-    g.add_node("portfolio", make_portfolio_node(agent_model))
-    g.add_node("risk", make_risk_node(agent_model))
-    # Research deps load lazily (embedder ~seconds) and only if a question routes to research.
-    deps = research_deps
-
-    def deps_provider():
-        nonlocal deps
-        if deps is None:
-            deps = research_deps_from_settings(s)
-        return deps
-
-    g.add_node("research", make_research_node(agent_model, report_model, deps_provider))
-    g.add_node("report", make_report_node(report_model))
-
-    g.add_edge(START, "supervisor")
-    g.add_conditional_edges(
-        "supervisor",
-        route_after_supervisor,
-        {"portfolio": "portfolio", "risk": "risk", "research": "research", "report": "report"},
+def make_run_context(csv_path: str, settings: Settings | None = None) -> RunContext:
+    """Load the portfolio and its market data, and pick the free model for each role."""
+    settings = settings or get_settings()
+    return RunContext(
+        portfolio=load_context(csv_path, settings),
+        router_llm=get_llm("router", settings),
+        agent_llm=get_llm("agent", settings),
+        report_llm=get_llm("report", settings),
+        settings=settings,
     )
-    for specialist in ("portfolio", "risk", "research"):
-        g.add_edge(specialist, "supervisor")
-    g.add_edge("report", END)
-    return g.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
 
 
-@contextmanager
-def open_checkpointer(path: str | Path) -> Iterator[SqliteSaver]:
-    """SqliteSaver on a local file (created if missing). check_same_thread=False because
-    LangGraph may run nodes on worker threads."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
-    try:
-        yield SqliteSaver(conn)
-    finally:
-        conn.close()
+# =========================
+# 2. State
+# =========================
+# FinSightState (state.py) is the shared notebook every node reads and writes.
+# The agent nodes (supervisor, portfolio, risk, research, report) live in agents/.
 
 
-def thread_config(thread_id: str) -> dict[str, Any]:
+# =========================
+# 3. Routing
+# =========================
+
+
+def route_after_supervisor(state: FinSightState) -> str:
+    """The supervisor already decided; this just tells LangGraph where to go."""
+    return state["next_agent"]
+
+
+# =========================
+# 4. Build the graph
+# =========================
+
+
+def build_graph(checkpointer, interrupt_before=None):
+    graph = StateGraph(FinSightState, context_schema=RunContext)
+
+    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("portfolio", portfolio_node)
+    graph.add_node("risk", risk_node)
+    graph.add_node("research", research_node)
+    graph.add_node("report", report_node)
+
+    graph.add_edge(START, "supervisor")
+    graph.add_conditional_edges("supervisor", route_after_supervisor, ["portfolio", "risk", "research", "report"])
+    graph.add_edge("portfolio", "supervisor")
+    graph.add_edge("risk", "supervisor")
+    graph.add_edge("research", "supervisor")
+    graph.add_edge("report", END)
+
+    # interrupt_before lets tests stop the run part-way, like a crash, to test resume.
+    return graph.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
+
+
+def open_checkpointer(path: str) -> SqliteSaver:
+    """SqliteSaver saves the state after every node, so a run can be resumed by thread id."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # check_same_thread=False: LangGraph may run nodes on another thread.
+    connection = sqlite3.connect(path, check_same_thread=False)
+    return SqliteSaver(connection)
+
+
+# =========================
+# 5. Run a question
+# =========================
+
+
+def thread_config(thread_id: str) -> dict:
     return {"configurable": {"thread_id": thread_id}}
 
 
-UpdateCallback = Callable[[str, dict[str, Any]], None]
+def run_question(graph, run_context: RunContext, question: str, thread_id: str,
+                 on_update=None, callbacks=None) -> dict:
+    """Ask a new question (or a follow-up on an existing thread). Returns the final state."""
+    portfolio = run_context.portfolio
+    graph_input = new_question(question, portfolio.csv_path, portfolio.as_of)
+    return stream_graph(graph, graph_input, run_context, thread_id, on_update, callbacks)
 
 
-def _stream(graph, graph_input, thread_id: str, ctx: PortfolioContext, on_update: UpdateCallback | None):
-    config = thread_config(thread_id)
-    for chunk in graph.stream(graph_input, config, context=ctx, stream_mode="updates"):
-        for node, update in chunk.items():
-            if on_update and node in NODES:
-                on_update(node, update or {})
-    return graph.get_state(config)
+def resume_thread(graph, run_context: RunContext, thread_id: str, on_update=None, callbacks=None) -> dict:
+    """Continue an unfinished run from its last checkpoint."""
+    saved = graph.get_state(thread_config(thread_id)).values
+    if saved["data_as_of"] != run_context.portfolio.as_of:
+        # Continuing would mix two days of prices in one report, so start the question again.
+        return run_question(graph, run_context, saved["question"], thread_id, on_update, callbacks)
+    # Input None means "carry on from the checkpoint".
+    return stream_graph(graph, None, run_context, thread_id, on_update, callbacks)
 
 
-def run_question(graph, ctx: PortfolioContext, question: str, thread_id: str, portfolio_source: str,
-                 on_update: UpdateCallback | None = None):
-    """Ask a (new or follow-up) question on a thread. Returns the final StateSnapshot."""
-    graph_input = new_question_input(question, portfolio_source, data_as_of=ctx.as_of)
-    return _stream(graph, graph_input, thread_id, ctx, on_update)
-
-
-def is_stale(graph, ctx: PortfolioContext, thread_id: str) -> bool:
-    """True if the thread's saved findings used market data from a different day than `ctx`."""
-    saved = graph.get_state(thread_config(thread_id)).values.get("data_as_of")
-    return bool(saved) and saved != ctx.as_of
-
-
-def resume_thread(graph, ctx: PortfolioContext, thread_id: str, on_update: UpdateCallback | None = None):
-    """Continue an unfinished run from its last checkpoint (input=None means 'resume').
-
-    If the saved findings used a different day's prices than `ctx`, continuing would mix two
-    days' data in one report, so the same question is re-asked from scratch instead.
-    """
-    if is_stale(graph, ctx, thread_id):
-        values = graph.get_state(thread_config(thread_id)).values
-        return run_question(graph, ctx, values["question"], thread_id, values["portfolio_source"], on_update)
-    return _stream(graph, None, thread_id, ctx, on_update)
+def stream_graph(graph, graph_input, run_context, thread_id, on_update, callbacks) -> dict:
+    """Run the graph, calling on_update(node_name, update) after each node finishes."""
+    config = {"configurable": {"thread_id": thread_id}, "callbacks": callbacks or []}
+    for chunk in graph.stream(graph_input, config, context=run_context, stream_mode="updates"):
+        for node_name, update in chunk.items():
+            if on_update and isinstance(update, dict):
+                on_update(node_name, update)
+    return graph.get_state(thread_config(thread_id)).values

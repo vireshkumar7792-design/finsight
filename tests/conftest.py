@@ -1,4 +1,4 @@
-"""Shared pytest fixtures."""
+"""Shared test fixtures: fake settings and fake market data, so tests never touch the network."""
 
 from pathlib import Path
 
@@ -6,39 +6,14 @@ import pandas as pd
 import pytest
 
 from finsight.config import Settings
-from finsight.context import PortfolioContext
-from finsight.schemas.portfolio import Holding, Portfolio
+from finsight.portfolio import market
+from finsight.portfolio.context import load_context
+from finsight.rag.ingest import ingest_html, open_collection
+from tests.fakes import HashEmbedder
 
 SAMPLES_DIR = Path(__file__).resolve().parents[1] / "data" / "samples"
 
-
-@pytest.fixture
-def samples_dir() -> Path:
-    return SAMPLES_DIR
-
-
-@pytest.fixture
-def two_stock_portfolio() -> Portfolio:
-    """AAPL 10 @ $100 and MSFT 5 @ $200: cost basis $1,000 each, $2,000 total."""
-    return Portfolio(
-        holdings=[
-            Holding(ticker="AAPL", quantity=10, avg_buy_price=100, asset_type="equity"),
-            Holding(ticker="MSFT", quantity=5, avg_buy_price=200, asset_type="equity"),
-        ]
-    )
-
-
-@pytest.fixture
-def two_stock_prices() -> dict[str, float]:
-    """AAPL now $150 (+50%), MSFT now $180 (-10%)."""
-    return {"AAPL": 150.0, "MSFT": 180.0}
-
-
-# ---- fake market data for PortfolioContext (offline) ------------------------------------
-#
-# Holdings: AAA 10 @ $100 (equity), BBB 20 @ $50 (etf), CASH $400.
-# Last closes: AAA 120, BBB 45  ->  MV: AAA 1200, BBB 900, CASH 400 = 2500
-# Weights: 48% / 36% / 16%.  Cost: 1000 + 1000 + 400 = 2400.  P&L: +200, -100, 0 = +100 (+4.17%)
+# A tiny fake market. Last closes: AAA 120, BBB 45.
 FAKE_CLOSES = {
     "AAA": [100.0, 110.0, 99.0, 120.0],
     "BBB": [50.0, 50.0, 55.0, 45.0],
@@ -46,49 +21,76 @@ FAKE_CLOSES = {
 }
 FAKE_SECTORS = {"AAA": "Technology", "BBB": "ETF / Fund"}
 
-
-class FakeMarket:
-    """Records what the context asked for, returns canned data shaped like market_data output."""
-
-    def __init__(self):
-        self.history_calls: list[tuple[list[str], str]] = []
-        self.sector_calls: list[list[str]] = []
-
-    def history(self, tickers, period):
-        tickers = list(tickers)
-        self.history_calls.append((tickers, period))
-        idx = pd.date_range("2024-01-01", periods=4, name="Date")
-        return pd.DataFrame({t: FAKE_CLOSES[t] for t in tickers}, index=idx)
-
-    def sectors(self, tickers):
-        self.sector_calls.append(list(tickers))
-        return {t: FAKE_SECTORS[t] for t in tickers}
+# AAA 10 @ $100, BBB 20 @ $50, $400 cash.
+# Market value: 1200 + 900 + 400 = 2500 -> weights 48% / 36% / 16%.
+# Cost: 1000 + 1000 + 400 = 2400 -> P&L +200, -100, 0 = +100 (+4.1667%).
+FAKE_CSV = """ticker,quantity,avg_buy_price,buy_date,asset_type,currency
+AAA,10,100,2024-01-02,equity,USD
+BBB,20,50,,etf,USD
+CASH,400,1,,cash,USD
+"""
 
 
 @pytest.fixture
-def fake_portfolio() -> Portfolio:
-    return Portfolio(
-        holdings=[
-            Holding(ticker="AAA", quantity=10, avg_buy_price=100, asset_type="equity"),
-            Holding(ticker="BBB", quantity=20, avg_buy_price=50, asset_type="etf"),
-            Holding(ticker="CASH", quantity=400, avg_buy_price=1, asset_type="cash"),
-        ]
+def test_settings(tmp_path) -> Settings:
+    """Dummy keys and temporary folders: the real .env is never read."""
+    return Settings(
+        groq_api_key="test-groq",
+        openrouter_api_key="test-openrouter",
+        market_cache_dir=str(tmp_path / "market"),
+        tavily_cache_dir=str(tmp_path / "tavily"),
+        checkpoint_path=str(tmp_path / "checkpoints.sqlite"),
+        chroma_path=str(tmp_path / "chroma"),
+        filings_dir=str(tmp_path / "filings"),
     )
 
 
 @pytest.fixture
-def fake_market() -> FakeMarket:
-    return FakeMarket()
+def fake_market(monkeypatch):
+    """Replace the two yfinance download functions. Records how often they are called."""
+    calls = {"closes": 0, "sectors": 0}
+
+    def fake_download_closes(tickers, period="1y"):
+        calls["closes"] += 1
+        dates = pd.date_range("2024-01-01", periods=4)
+        return pd.DataFrame({ticker: FAKE_CLOSES[ticker] for ticker in tickers}, index=dates)
+
+    def fake_download_sector(ticker):
+        calls["sectors"] += 1
+        return FAKE_SECTORS.get(ticker, "Unknown")
+
+    monkeypatch.setattr(market, "download_closes", fake_download_closes)
+    monkeypatch.setattr(market, "download_sector", fake_download_sector)
+    return calls
 
 
 @pytest.fixture
-def test_settings() -> Settings:
-    """Settings with dummy keys: never reads the real .env values."""
-    return Settings(groq_api_key="test-groq", openrouter_api_key="test-or")
+def fake_csv(tmp_path) -> str:
+    path = tmp_path / "fake.csv"
+    path.write_text(FAKE_CSV, encoding="utf-8")
+    return str(path)
 
 
 @pytest.fixture
-def fake_ctx(fake_portfolio, fake_market, test_settings) -> PortfolioContext:
-    return PortfolioContext.load(
-        fake_portfolio, test_settings, fetch_history=fake_market.history, fetch_sectors=fake_market.sectors
-    )
+def portfolio_context(fake_market, fake_csv, test_settings):
+    """The fake portfolio loaded with fake market data."""
+    return load_context(fake_csv, test_settings)
+
+
+# A tiny fake 10-K, ingested twice under two different companies (for the ticker filter).
+MINI_10K = (Path(__file__).parent / "fixtures" / "mini_10k.html").read_text(encoding="utf-8")
+
+
+def fake_filing(ticker: str) -> dict:
+    return {"ticker": ticker, "company": f"{ticker} Corp", "form": "10-K", "fiscal_year": 2025,
+            "filing_date": "2025-02-01", "accession": f"{ticker}-0001", "url": f"https://example.com/{ticker}"}
+
+
+@pytest.fixture
+def filings_index(tmp_path):
+    """A real Chroma collection on disk, filled using the fake embedder. Returns (collection, embedder)."""
+    embedder = HashEmbedder()
+    collection = open_collection(str(tmp_path / "chroma"), embedder.name)
+    ingest_html(MINI_10K, fake_filing("ACME"), collection, embedder)
+    ingest_html(MINI_10K, fake_filing("OTHER"), collection, embedder)
+    return collection, embedder

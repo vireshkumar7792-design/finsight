@@ -1,135 +1,80 @@
-"""10-K parsing, chunking, Chroma ingest + retrieval (offline: fixture HTML + HashEmbedder)."""
+"""10-K parsing, chunking, idempotent ingest and filtered search, all offline (fake embedder)."""
 
-from pathlib import Path
+from finsight.rag.ingest import ingest_html
+from finsight.rag.parse import chunk_words, html_to_text, make_chunks, split_sections
+from finsight.rag.retriever import indexed_tickers, normalize_section, search_filings
+from tests.conftest import MINI_10K, fake_filing
 
-import pytest
-
-from tests.fakes import HashEmbedder
-from finsight.rag.ingest import ingest_html, sample_equity_tickers
-from finsight.rag.parse import FULL_DOCUMENT, chunk_words, html_to_text, make_chunks, split_sections
-from finsight.rag.retriever import FilingRetriever, normalize_section, trim
-from finsight.rag.store import EmbeddingModelMismatchError, open_collection
-
-FIXTURE = (Path(__file__).parent / "fixtures" / "mini_10k.html").read_text(encoding="utf-8")
+# =========================
+# Parsing
+# =========================
 
 
-def meta(ticker="ACME", fy=2026, accession="0000000000-26-000001"):
-    return {"ticker": ticker, "company": f"{ticker} Corp", "form": "10-K", "fiscal_year": fy,
-            "filing_date": "2026-02-20", "report_date": f"{fy}-01-31", "accession": accession,
-            "url": f"https://www.sec.gov/Archives/edgar/data/1/{ticker}.htm"}
+def test_html_to_text_drops_scripts_styles_and_hidden_data():
+    text = html_to_text(MINI_10K)
+    assert "rocket powered roller skates" in text
+    assert "SCRIPT TEXT" not in text
+    assert "HIDDEN XBRL" not in text
+    assert "color:red" not in text
 
 
-# ---- HTML -> text -> sections -------------------------------------------------------------------
+def test_sections_use_the_real_heading_not_the_table_of_contents():
+    sections = split_sections(html_to_text(MINI_10K))
+    assert [section["key"] for section in sections] == ["1", "1A", "7", "8"]
+    risk_factors = sections[1]
+    assert risk_factors["title"] == "Item 1A Risk Factors"
+    assert "suppliers of rocket engines" in risk_factors["text"]
 
 
-def test_html_to_text_drops_hidden_script_and_xbrl():
-    text = html_to_text(FIXTURE)
-    assert "HIDDEN XBRL" not in text and "SCRIPT TEXT" not in text and ".x{color" not in text
-    assert "Acme designs rocket powered roller skates" in text
-    assert "\nItem 1A. Risk Factors\n" in text  # block tags become line breaks
+def test_text_without_items_becomes_one_full_document():
+    sections = split_sections("Just some text.\nNo headings here.")
+    assert [section["key"] for section in sections] == ["FULL"]
 
 
-def test_split_sections_skips_table_of_contents():
-    sections, ok = split_sections(html_to_text(FIXTURE))
-    assert ok
-    assert [s.key for s in sections] == ["1", "1A", "7", "8"]
-    by_key = {s.key: s for s in sections}
-    assert by_key["1A"].title == "Item 1A Risk Factors"
-    assert by_key["1A"].text.startswith("Our business depends on a small number of suppliers")  # body, not TOC
-    assert "see Item 7 of this report" in by_key["1A"].text  # mid-sentence reference is not a heading
-    assert "Revenue grew" in by_key["7"].text
+def test_chunks_overlap():
+    words = " ".join(str(number) for number in range(10))
+    # size 4, overlap 2 -> starts at 0, 2, 4, 6 (the last one reaches the end)
+    assert chunk_words(words, size=4, overlap=2) == ["0 1 2 3", "2 3 4 5", "4 5 6 7", "6 7 8 9"]
 
 
-def test_split_sections_falls_back_to_full_document():
-    sections, ok = split_sections("Just some text.\nNo item headings here at all.")
-    assert not ok
-    assert [(s.key, s.title) for s in sections] == [(FULL_DOCUMENT, "Full document")]
+def test_chunk_ids_and_skipped_sections():
+    chunks = make_chunks(split_sections(html_to_text(MINI_10K)), fake_filing("ACME"))
+    ids = [chunk["id"] for chunk in chunks]
+    assert ids == ["ACME-10K-FY2025-1-000", "ACME-10K-FY2025-1A-000", "ACME-10K-FY2025-7-000"]  # no Item 8
+    assert chunks[1]["metadata"]["section"] == "Item 1A Risk Factors"
 
 
-def test_chunk_words_known_answer():
-    words = " ".join(f"w{i}" for i in range(10))
-    # size 4, overlap 1 -> step 3: w0-w3, w3-w6, w6-w9
-    assert chunk_words(words, size=4, overlap=1) == ["w0 w1 w2 w3", "w3 w4 w5 w6", "w6 w7 w8 w9"]
-    assert chunk_words("", 4, 1) == []
-    with pytest.raises(ValueError):
-        chunk_words(words, size=4, overlap=4)
+# =========================
+# Ingest + search
+# =========================
 
 
-def test_make_chunks_metadata_ids_and_section_filter():
-    sections, _ = split_sections(html_to_text(FIXTURE))
-    chunks = make_chunks(sections, meta(), size=30, overlap=5)
-    keys = {c.metadata["section_key"] for c in chunks}
-    assert keys == {"1", "1A", "7"}  # Item 8 (financial tables) not indexed
-    first_1a = next(c for c in chunks if c.metadata["section_key"] == "1A")
-    assert first_1a.chunk_id == "ACME-10K-FY2026-1A-000"
-    assert first_1a.metadata | {} == {**meta(), "section_key": "1A", "section": "Item 1A Risk Factors",
-                                      "chunk_id": "ACME-10K-FY2026-1A-000", "chunk_index": 0}
-    assert all(None not in c.metadata.values() for c in chunks)  # Chroma rejects None
-    assert len({c.chunk_id for c in chunks}) == len(chunks)
+def test_ingest_twice_does_not_duplicate(filings_index):
+    collection, embedder = filings_index
+    count = collection.count()
+    result = ingest_html(MINI_10K, fake_filing("ACME"), collection, embedder)
+    assert result["status"] == "already ingested"
+    assert collection.count() == count == 6  # 3 chunks x 2 companies
 
 
-# ---- Chroma ingest + retrieval ----------------------------------------------------------------------
+def test_ticker_filter_never_returns_another_company(filings_index):
+    collection, embedder = filings_index
+    hits = search_filings(collection, embedder, "supply chain risks rocket engines", ticker="acme")
+    assert hits
+    assert {hit["ticker"] for hit in hits} == {"ACME"}
 
 
-@pytest.fixture
-def collection(tmp_path):
-    return open_collection(tmp_path / "chroma", HashEmbedder.name)
+def test_section_filter(filings_index):
+    collection, embedder = filings_index
+    hits = search_filings(collection, embedder, "anything", ticker="ACME", section="Item 1A")
+    assert [hit["id"] for hit in hits] == ["ACME-10K-FY2025-1A-000"]
+    assert hits[0]["url"] == "https://example.com/ACME"
 
 
-def other_company_html():
-    return FIXTURE.replace("Acme", "Globex").replace("rocket engines", "semiconductor wafers")
-
-
-def test_ingest_is_idempotent(collection):
-    emb = HashEmbedder()
-    first = ingest_html(FIXTURE, meta(), collection, emb)
-    n = collection.count()
-    assert first.status == "ingested" and first.chunks == n > 0
-    second = ingest_html(FIXTURE, meta(), collection, emb)
-    assert second.status == "already_ingested"
-    assert collection.count() == n  # no duplicates
-    forced = ingest_html(FIXTURE, meta(), collection, emb, force=True)
-    assert forced.status == "ingested" and collection.count() == n
-
-
-def test_retriever_filters_by_ticker_and_section(collection):
-    emb = HashEmbedder()
-    ingest_html(FIXTURE, meta("ACME"), collection, emb)
-    ingest_html(other_company_html(), meta("GLBX", accession="0000000000-26-000002"), collection, emb)
-    r = FilingRetriever(collection, emb, max_chars=200)
-
-    assert r.available_tickers() == {"ACME", "GLBX"}
-    unfiltered = r.search("supply chain disruption suppliers", k=10)
-    assert {h.ticker for h in unfiltered} == {"ACME", "GLBX"}  # similar text from both companies
-
-    acme = r.search("supply chain disruption suppliers", ticker="acme", k=10)
-    assert acme and {h.ticker for h in acme} == {"ACME"}
-    risks = r.search("supply chain disruption suppliers", ticker="ACME", section="Risk Factors", k=10)
-    assert risks and {h.section_key for h in risks} == {"1A"}
-    top = risks[0]
-    assert top.chunk_id.startswith("ACME-10K-FY2026-1A-") and 0 < top.score <= 1
-    assert len(top.text) <= 204  # trimmed to max_chars (+ " ...")
-
-
-def test_embedding_model_mismatch_is_refused(tmp_path):
-    open_collection(tmp_path / "c", "model-a")
-    with pytest.raises(EmbeddingModelMismatchError):
-        open_collection(tmp_path / "c", "model-b")
-
-
-@pytest.mark.parametrize("raw, key", [("1A", "1A"), ("Item 1A", "1A"), ("item 7a. market risk", "7A"),
-                                      ("Risk Factors", "1A"), ("business", "1"), ("", None), (None, None),
-                                      ("banana", None)])
-def test_normalize_section(raw, key):
-    assert normalize_section(raw) == key
-
-
-def test_trim():
-    assert trim("short", 10) == "short"
-    assert trim("one two three four", 9) == "one two ..."
-
-
-def test_sample_equity_tickers_skip_funds_and_cash():
-    tickers = sample_equity_tickers()
-    assert {"AAPL", "MSFT", "NVDA", "TSLA", "COIN", "JPM", "JNJ", "GOOGL", "AMZN"} == set(tickers)
-    assert not {"VTI", "BND", "SPY", "QQQ", "CASH"} & set(tickers)
+def test_indexed_tickers_and_section_names(filings_index):
+    collection, _ = filings_index
+    assert indexed_tickers(collection) == {"ACME", "OTHER"}
+    assert normalize_section("1a") == "1A"
+    assert normalize_section("Item 7") == "7"
+    assert normalize_section("Risk Factors") == "1A"
+    assert normalize_section("") is None

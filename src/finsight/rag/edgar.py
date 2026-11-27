@@ -1,125 +1,91 @@
-"""SEC EDGAR client: ticker -> CIK -> latest 10-K -> primary document (HTML) on disk.
-
-SEC rules (sec.gov/os/accessing-edgar-data): declare a User-Agent with contact info, and stay
-under 10 requests/second. The User-Agent comes from SEC_USER_AGENT in .env (a SecretStr in
-Settings); it is only ever placed in the request header, never printed, logged or stored.
-
-Requests per new ticker: ~2 (submissions JSON + primary document); the ticker->CIK map is one
-shared file cached on disk for a week.
-"""
-
-from __future__ import annotations
+"""Download a company's latest 10-K from SEC EDGAR (free). The SEC needs a User-Agent with contact info."""
 
 import json
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import httpx
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
-ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{doc}"
-TICKER_MAP_TTL_SECONDS = 7 * 24 * 3600
+DOCUMENT_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
+
+SECONDS_BETWEEN_REQUESTS = 0.25  # 4 requests/second; the SEC allows 10
+TICKER_LIST_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+last_request_time = 0.0
 
 
-class MissingUserAgentError(RuntimeError):
-    """SEC_USER_AGENT is required by the SEC for automated access."""
+# =========================
+# HTTP
+# =========================
 
 
-class FilingNotFoundError(LookupError):
-    pass
+def sec_get(url: str, user_agent: str) -> httpx.Response:
+    """GET with a small pause between requests. The User-Agent goes only into the header."""
+    global last_request_time
+    wait = SECONDS_BETWEEN_REQUESTS - (time.monotonic() - last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    last_request_time = time.monotonic()
+    response = httpx.get(url, headers={"User-Agent": user_agent}, timeout=30, follow_redirects=True)
+    response.raise_for_status()
+    return response
 
 
-@dataclass(frozen=True)
-class FilingRef:
-    ticker: str
-    cik: int
-    company: str
-    form: str
-    accession: str  # with dashes: 0001045810-26-000021
-    primary_document: str
-    filing_date: str  # YYYY-MM-DD
-    report_date: str  # period end, YYYY-MM-DD
-    url: str
-
-    @property
-    def fiscal_year(self) -> int:
-        """Fiscal year = year of the period end date (NVDA's FY2026 ends Jan 2026, AAPL's Sept)."""
-        return int(self.report_date[:4])
+# =========================
+# Find the filing
+# =========================
 
 
-class EdgarClient:
-    def __init__(
-        self,
-        user_agent: str | None,
-        data_dir: str | Path = "data/filings",
-        *,
-        requests_per_second: float = 4.0,  # SEC allows 10/s; we stay well below
-        http: httpx.Client | None = None,
-    ):
-        if not user_agent or not user_agent.strip():
-            raise MissingUserAgentError(
-                "SEC_USER_AGENT is not set in .env. The SEC requires a User-Agent with contact "
-                'info, e.g. SEC_USER_AGENT="FinSight research you@example.com".'
-            )
-        self.dir = Path(data_dir)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self._http = http or httpx.Client(timeout=30.0, follow_redirects=True)
-        self._headers = {"User-Agent": user_agent.strip(), "Accept-Encoding": "gzip, deflate"}
-        self._min_interval = 1.0 / requests_per_second
-        self._last = 0.0
-        self.requests_made = 0
+def lookup_company(ticker: str, user_agent: str, filings_dir: str) -> tuple[int, str]:
+    """Ticker -> (CIK number, company name). The SEC's ticker list is cached for a week."""
+    path = Path(filings_dir) / "company_tickers.json"
+    is_old = path.exists() and time.time() - path.stat().st_mtime > TICKER_LIST_MAX_AGE_SECONDS
+    if not path.exists() or is_old:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(sec_get(TICKERS_URL, user_agent).text, encoding="utf-8")
 
-    # ---- HTTP with throttle --------------------------------------------------------------------
+    companies = json.loads(path.read_text(encoding="utf-8"))
+    wanted = ticker.upper().replace(".", "-")  # the SEC writes BRK.B as BRK-B
+    for company in companies.values():
+        if company["ticker"].upper() == wanted:
+            return int(company["cik_str"]), company["title"]
+    raise LookupError(f"{ticker}: not in the SEC's company list (ETFs and funds don't file 10-Ks)")
 
-    def _get(self, url: str) -> httpx.Response:
-        wait = self._min_interval - (time.monotonic() - self._last)  # stay under the SEC's rate limit
-        if wait > 0:
-            time.sleep(wait)
-        self._last = time.monotonic()
-        resp = self._http.get(url, headers=self._headers)
-        self.requests_made += 1
-        resp.raise_for_status()
-        return resp
 
-    # ---- lookups -------------------------------------------------------------------------------
+def latest_10k(ticker: str, user_agent: str, filings_dir: str) -> dict:
+    """Facts about the newest 10-K: company, dates, accession number and document URL."""
+    cik, company = lookup_company(ticker, user_agent, filings_dir)
+    recent = sec_get(SUBMISSIONS_URL.format(cik=cik), user_agent).json()["filings"]["recent"]
+    for i, form in enumerate(recent["form"]):  # newest first
+        if form != "10-K":  # exact match skips amendments ("10-K/A")
+            continue
+        accession = recent["accessionNumber"][i]
+        document = recent["primaryDocument"][i]
+        report_date = recent["reportDate"][i] or recent["filingDate"][i]
+        return {
+            "ticker": ticker.upper(),
+            "company": company,
+            "form": "10-K",
+            "fiscal_year": int(report_date[:4]),  # year the fiscal period ended
+            "filing_date": recent["filingDate"][i],
+            "accession": accession,
+            "url": DOCUMENT_URL.format(cik=cik, accession=accession.replace("-", ""), document=document),
+        }
+    raise LookupError(f"{ticker}: no 10-K in its recent filings")
 
-    def _ticker_map(self) -> dict[str, dict]:
-        path = self.dir / "company_tickers.json"
-        if not path.exists() or time.time() - path.stat().st_mtime > TICKER_MAP_TTL_SECONDS:
-            path.write_text(self._get(TICKERS_URL).text, encoding="utf-8")
-        raw = json.loads(path.read_text(encoding="utf-8"))  # {"0": {"cik_str", "ticker", "title"}, ...}
-        return {row["ticker"].upper(): row for row in raw.values()}
 
-    def lookup_cik(self, ticker: str) -> tuple[int, str]:
-        row = self._ticker_map().get(ticker.strip().upper().replace(".", "-"))
-        if row is None:
-            raise FilingNotFoundError(f"{ticker}: not in SEC's ticker list (ETFs and funds don't file 10-Ks)")
-        return int(row["cik_str"]), row["title"]
+# =========================
+# Download
+# =========================
 
-    def latest_filing(self, ticker: str, form: str = "10-K") -> FilingRef:
-        cik, company = self.lookup_cik(ticker)
-        recent = self._get(SUBMISSIONS_URL.format(cik=cik)).json()["filings"]["recent"]
-        for i, f in enumerate(recent["form"]):  # newest first; exact match skips "10-K/A"
-            if f == form:
-                acc, doc = recent["accessionNumber"][i], recent["primaryDocument"][i]
-                return FilingRef(
-                    ticker=ticker.upper(), cik=cik, company=company, form=form, accession=acc,
-                    primary_document=doc, filing_date=recent["filingDate"][i],
-                    report_date=recent["reportDate"][i] or recent["filingDate"][i],
-                    url=ARCHIVE_URL.format(cik=cik, acc_nodash=acc.replace("-", ""), doc=doc),
-                )
-        raise FilingNotFoundError(f"{ticker}: no {form} in recent filings")
 
-    # ---- download --------------------------------------------------------------------------------
-
-    def download(self, ref: FilingRef) -> Path:
-        """Save the primary document (skip if already on disk) plus a small JSON of its metadata."""
-        folder = self.dir / ref.ticker
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"{ref.accession}_{ref.primary_document}"
-        if not path.exists():
-            path.write_bytes(self._get(ref.url).content)
-        path.with_suffix(".json").write_text(json.dumps(asdict(ref), indent=1), encoding="utf-8")
-        return path
+def download_10k(ticker: str, user_agent: str, filings_dir: str) -> tuple[str, dict]:
+    """Returns (HTML text, filing facts). The HTML is saved once and reused afterwards."""
+    filing = latest_10k(ticker, user_agent, filings_dir)
+    path = Path(filings_dir) / filing["ticker"] / f"{filing['accession']}.html"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(sec_get(filing["url"], user_agent).content)
+    return path.read_text(encoding="utf-8", errors="replace"), filing
